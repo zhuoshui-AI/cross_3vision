@@ -34,10 +34,20 @@ def run_inference(cfg, ckpt_path=None, device=None):
         model.load_state_dict(state.get("model", state), strict=False)
     model.eval()
 
-    data_root = cfg["data"]["data_root"]
+    # Same resolution logic as train.py: test_split may be an absolute dir
+    # (the AIC2026 layout) or a relative split-file path under data_root.
+    data_root = cfg["data"].get("data_root")
     test_split = cfg["data"].get("test_split")
-    split_file = (os.path.join(data_root, test_split)
-                  if test_split else None)
+    if test_split and os.path.isabs(test_split) and os.path.isdir(test_split):
+        data_root, split_file = test_split, None
+    elif test_split:
+        split_file = os.path.join(data_root, test_split) if data_root else test_split
+    else:
+        split_file = None
+    if data_root is None:
+        raise ValueError(
+            "data.data_root or data.test_split (absolute dir) must be set")
+
     ds = MultiModalDataset(
         data_root=data_root, split_file=split_file, ids=None,
         img_size=int(cfg["data"]["img_size"]), train=False,

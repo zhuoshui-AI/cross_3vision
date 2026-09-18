@@ -76,20 +76,74 @@ def train(cfg, resume=None):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     log.info(f"Device: {device}")
 
-    data_root = cfg["data"]["data_root"]
     img_size = int(cfg["data"]["img_size"])
     ncls = int(cfg["model"]["num_labels"])
 
-    train_ds = MultiModalDataset(
-        data_root=data_root,
-        split_file=os.path.join(data_root, cfg["data"]["train_split"])
-        if cfg["data"].get("train_split") else None,
-        img_size=img_size, train=True, num_classes=ncls)
-    val_ds = MultiModalDataset(
-        data_root=data_root,
-        split_file=os.path.join(data_root, cfg["data"]["val_split"])
-        if cfg["data"].get("val_split") else None,
-        img_size=img_size, train=False, num_classes=ncls)
+    def _resolve(split_key):
+        """Resolve (data_root, split_file) for a split.
+
+        Supports two config styles:
+          1) data_root + split_file:  split_key = "splits/train.txt" (relative
+             to data_root); data_root holds rgb/ir/depth/labels subdirs.
+          2) split_key = absolute directory path: the directory itself holds
+             rgb/ir/depth/labels; data_root = that dir, split_file = None
+             (auto-scan labels/). This is how AIC2026 train/test sets are laid
+             out — two independent dataset directories.
+        """
+        data_root = cfg["data"].get("data_root")
+        sp = cfg["data"].get(split_key)
+        if sp and os.path.isabs(sp) and os.path.isdir(sp):
+            return sp, None
+        if sp:
+            return data_root, os.path.join(data_root, sp) if data_root else sp
+        return data_root, None
+
+    train_root, train_split = _resolve("train_split")
+    val_root, val_split = _resolve("val_split")
+    if train_root is None:
+        raise ValueError(
+            "data.data_root or data.train_split (absolute dir) must be set")
+
+    # ---- Split strategy ----
+    # If val_split points to a *different* directory, use it as an independent
+    # val set. Otherwise (val_split is null, missing, or the same dir as train)
+    # carve out a val_ratio fraction of the training IDs as the val set.
+    # This is the recommended setup for AIC2026: the test set has no labels, so
+    # we hold out part of the training set for mAP validation.
+    use_separate_val = (val_root is not None
+                        and val_split is not None
+                        and os.path.abspath(val_root) != os.path.abspath(train_root))
+
+    if use_separate_val:
+        train_ds = MultiModalDataset(
+            data_root=train_root, split_file=train_split,
+            img_size=img_size, train=True, num_classes=ncls)
+        val_ds = MultiModalDataset(
+            data_root=val_root, split_file=val_split,
+            img_size=img_size, train=False, num_classes=ncls)
+        log.info(f"Val set: independent dir {val_root} ({len(val_ds)} imgs)")
+    else:
+        # Get the full ID list once, then split by val_ratio.
+        full_ds = MultiModalDataset(
+            data_root=train_root, split_file=train_split,
+            img_size=img_size, train=True, num_classes=ncls)
+        n_total = len(full_ds)
+        val_ratio = float(cfg["data"].get("val_ratio", 0.1))
+        n_val = max(1, int(round(n_total * val_ratio)))
+        n_train = n_total - n_val
+        g = torch.Generator().manual_seed(42)
+        perm = torch.randperm(n_total, generator=g).tolist()
+        train_ids = [full_ds.ids[i] for i in perm[:n_train]]
+        val_ids = [full_ds.ids[i] for i in perm[n_train:]]
+        train_ds = MultiModalDataset(
+            data_root=train_root, ids=train_ids,
+            img_size=img_size, train=True, num_classes=ncls)
+        val_ds = MultiModalDataset(
+            data_root=train_root, ids=val_ids,
+            img_size=img_size, train=False, num_classes=ncls)
+        log.info(f"Split train set {train_root}: {n_train} train / {n_val} val "
+                 f"(val_ratio={val_ratio})")
+
     nw = int(cfg["data"].get("num_workers", 4))
     train_loader = DataLoader(
         train_ds, batch_size=int(tcfg["batch_size"]), shuffle=True,
