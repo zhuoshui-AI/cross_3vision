@@ -1,0 +1,83 @@
+# Multimodal Swin-DETR default config
+
+# ---- Data ----
+data:
+  data_root: "./data"          # 占位，真实路径覆盖此值
+  train_split: "splits/train.txt"
+  val_split: "splits/val.txt"
+  test_split: "splits/test.txt"
+  img_size: 512                # 训练/推理统一边长（Swin 下采样 32x → 特征图 16x16）
+  num_workers: 8
+
+# ---- Model ----
+model:
+  # RGB backbone (Swin Transformer, ImageNet-22k pretrained)
+  swin_variant: "swin_small_patch4_window7_224"   # timm name (new timm dropped the _22k suffix; ImageNet-22k weights come via pretrained=True / pretrained_path)
+  swin_out_stage: 3                                   # 取 stage3 (stride 32)
+  swin_freeze_stages: 2                               # 前 2 stage 冻结
+  swin_pretrained: true                              # 训练时从 timm hub 拉权重（构造时默认关闭以免联网）
+  swin_pretrained_tag: "ms_in22k"                     # timm tag → ImageNet-22k 权重
+  swin_pretrained_path: "./weights/swin_small_patch4_window7_224_22k.pth"  # 离线权重；存在则优先用，不存在则走 hub
+
+  # IR backbone
+  ir_backbone: "resnet50_imagenet_1ch"                 # fallback；"anythermal" 切换到 AnyThermal
+  ir_pretrained_path: null                            # AnyThermal 权重路径
+
+  # DETR head
+  num_labels: 12
+  num_queries: 100
+  d_model: 256
+  encoder_layers: 6
+  decoder_layers: 6
+  auxiliary_loss: true
+
+  # Fusion
+  cssa_tau: 0.5                 # 通道切换阈值，固定不学
+  cssa_reduction: 16             # 通道评分 1D conv reduction
+  depth_fuse_heads: 8
+
+# 12-class label map
+id2label:
+  0: "person"
+  1: "boat"
+  2: "animal"
+  3: "seat"
+  4: "sign"
+  5: "bicycle"
+  6: "car"
+  7: "ball"
+  8: "light"
+  9: "garbage_can"
+  10: "uav"
+  11: "tricycle"
+
+# ---- Training ----
+train:
+  epochs: 150
+  batch_size: 8
+  grad_accum: 2                  # 等效 batch 16
+  optimizer: "adamw"
+  lr: 1.0e-4
+  weight_decay: 1.0e-4
+  backbone_lr: 1.0e-5           # Swin/IR backbone 微调 lr
+  scheduler: "cosine"
+  warmup_steps: 1000
+  grad_clip: 0.1
+  amp: true                      # bf16/fp16
+  label_smoothing: 0.1
+  ema_decay: 0.9997             # 设 0 关闭
+  log_dir: "./outputs/logs"
+  ckpt_dir: "./outputs/ckpt"
+  val_interval: 5
+
+# Loss weights (DETR 默认)
+loss:
+  loss_ce: 1.0
+  loss_bbox: 5.0
+  loss_giou: 2.0
+
+# ---- Inference ----
+inference:
+  conf_threshold: 0.05          # 过滤低置信度；空图也写空文件
+  max_dets_per_image: 100       # 赛题上限
+  output_dir: "./outputs/predictions"
