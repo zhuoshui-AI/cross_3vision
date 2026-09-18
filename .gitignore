@@ -8,14 +8,12 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# ---- Data / weights / outputs (large or generated; do not commit) ----
+# ---- Data / outputs (large or generated; do not commit) ----
 data/
-weights/
 outputs/
-*.pth
-*.pt
-*.ckpt
 *.onnx
+# Pretrained weights are intentionally tracked in ./weights/ for offline use.
+# Training checkpoints (outputs/) are NOT committed.
 
 # ---- IDE / tooling ----
 .trae/

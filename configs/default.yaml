@@ -21,7 +21,7 @@ model:
 
   # IR backbone
   ir_backbone: "resnet50_imagenet_1ch"                 # fallback；"anythermal" 切换到 AnyThermal
-  ir_pretrained_path: null                            # AnyThermal 权重路径
+  ir_pretrained_path: "./weights/resnet50-11ad3fa6.pth"  # resnet50_v2 本地权重（离线用）；anythermal 时指向其权重
 
   # DETR head
   num_labels: 12
