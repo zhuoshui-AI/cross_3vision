@@ -18,6 +18,22 @@ from torch.utils.data import Dataset
 import albumentations as A
 from albumentations import BboxParams
 
+# Albumentations 2.x changed geometric transforms: size must be a single
+# `size=(h, w)` tuple instead of positional (height, width) ints. Detect once
+# and build kwargs accordingly so both 1.x and 2.x work.
+try:
+    from packaging.version import parse as _parse_ver
+    _ALBU_V2 = _parse_ver(A.__version__) >= _parse_ver("2.0")
+except Exception:  # pragma: no cover - packaging always present via pip
+    _ALBU_V2 = False
+
+
+def _size_kwargs(size):
+    """Return size kwargs compatible with both albumentations 1.x and 2.x."""
+    if _ALBU_V2:
+        return {"size": (size, size)}
+    return {"height": size, "width": size}
+
 IMG_EXTS = (".jpg", ".jpeg", ".png")
 
 # ImageNet statistics for RGB branch (Swin expects these).
@@ -108,7 +124,7 @@ class MultiModalDataset(Dataset):
         if train:
             transforms = [
                 A.RandomResizedCrop(
-                    self.img_size, self.img_size,
+                    **_size_kwargs(self.img_size),
                     scale=(0.5, 1.0), ratio=(0.8, 1.2),
                     interpolation=cv2.INTER_LINEAR, p=1.0,
                 ),
@@ -116,7 +132,7 @@ class MultiModalDataset(Dataset):
             ]
         else:
             transforms = [
-                A.Resize(self.img_size, self.img_size,
+                A.Resize(**_size_kwargs(self.img_size),
                          interpolation=cv2.INTER_LINEAR),
             ]
         return A.ReplayCompose(
