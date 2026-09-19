@@ -22,6 +22,27 @@ def _conv_bn_act(in_c, out_c, k=3, s=2, p=1):
     )
 
 
+def convert_msft_swin_to_timm(state):
+    """Remap official Microsoft Swin checkpoint keys to modern timm layout.
+
+    Tensors are identical; only the stage index of PatchMerging differs:
+      official: layers.{0,1,2}.downsample.*   (downsample at end of stage i)
+      timm    : layers.{1,2,3}.downsample.*   (downsample at start of stage i+1)
+    Block / patch_embed / norm keys stay the same.
+    """
+    remapped = {}
+    for k, v in state.items():
+        nk = k
+        if k.startswith("layers.0.downsample."):
+            nk = "layers.1.downsample." + k[len("layers.0.downsample."):]
+        elif k.startswith("layers.1.downsample."):
+            nk = "layers.2.downsample." + k[len("layers.1.downsample."):]
+        elif k.startswith("layers.2.downsample."):
+            nk = "layers.3.downsample." + k[len("layers.2.downsample."):]
+        remapped[nk] = v
+    return remapped
+
+
 class SwinRGBBackbone(nn.Module):
     """Swin Transformer (ImageNet-22k) producing stride-32 features.
 
@@ -54,10 +75,41 @@ class SwinRGBBackbone(nn.Module):
             kwargs.pop("pretrained_cfg", None)
             self.swin = timm.create_model(variant, **kwargs)
         if path_ok:
+            import logging
             state = torch.load(pretrained_path, map_location="cpu")
             if "model" in state:
                 state = state["model"]
-            self.swin.load_state_dict(state, strict=False)
+            state = convert_msft_swin_to_timm(state)
+            result = self.swin.load_state_dict(state, strict=False)
+            # Every backbone tensor must match; the only tolerated leftovers
+            # are the 22k classifier head and the precomputed attn-mask
+            # buffers. Shape mismatches must be surfaced, not silently skipped.
+            model_keys = set(self.swin.state_dict().keys())
+            ck_keys = set(state.keys())
+
+            def _is_head_or_buffer(k):
+                return (k.startswith("head.")
+                        or "attn_mask" in k
+                        or k.startswith("patch_embed.norm"))
+
+            shape_bad = [k for k in (ck_keys & model_keys)
+                         if state[k].shape != self.swin.state_dict()[k].shape]
+            missing_backbone = [
+                k for k in (model_keys - ck_keys)
+                if not _is_head_or_buffer(k)]
+            logger = logging.getLogger(__name__)
+            if shape_bad:
+                logger.error("Swin checkpoint shape mismatches: %s", shape_bad)
+            if missing_backbone:
+                logger.warning(
+                    "Swin checkpoint missing backbone keys (random-init): %s",
+                    missing_backbone[:10])
+            logger.info(
+                "Loaded Swin 22k checkpoint: %d tensors matched "
+                "(unexpected leftovers: %d, e.g. %s)",
+                len(ck_keys & model_keys) - len(shape_bad),
+                len(result.unexpected_keys),
+                result.unexpected_keys[:5])
         # Swin uses relative position bias (not absolute), so it accepts
         # arbitrary input sizes as long as they divide the patch size. The
         # stock PatchEmbed asserts H/W == img_size; disable that so we can
