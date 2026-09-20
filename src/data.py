@@ -171,9 +171,17 @@ class MultiModalDataset(Dataset):
         rgb = np.array(Image.open(find_image(stem, self.rgb_dir)).convert("RGB"))
         ir3 = np.array(Image.open(find_image(stem, self.ir_dir)).convert("RGB"))
         ir = ir3[..., :1]  # 3-channel thermal stack → single channel (spec: visually identical)
-        depth = np.array(Image.open(find_image(stem, self.depth_dir))).astype(np.float32)
+        # Depth files may decode as 'I;16' (1ch, the expected case) or as
+        # 'RGB'/'P' (3ch) depending on how they were saved; force to a single
+        # channel so downstream tensors are always (1, H, W).
+        depth_img = Image.open(find_image(stem, self.depth_dir))
+        if depth_img.mode not in ("I", "I;16", "L"):
+            depth_img = depth_img.convert("L")
+        depth = np.array(depth_img).astype(np.float32)
         if depth.ndim == 2:
             depth = depth[..., None]
+        elif depth.ndim == 3 and depth.shape[-1] != 1:
+            depth = depth[..., :1]
 
         boxes, class_labels = load_label(
             os.path.join(self.label_dir, stem + ".txt"), self.num_classes)
