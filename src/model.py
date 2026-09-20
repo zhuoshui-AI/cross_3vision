@@ -152,9 +152,14 @@ class MultiModalSwinDETR(DetrForObjectDetection):
         if cfg is None:
             raise ValueError("MultiModalSwinDETR needs the run config `cfg`.")
         self.model.backbone.conv_encoder = MultiModalBackbone(cfg)
-        # Re-init the freshly-created modules.
+        # Initialize only the freshly-created input_projection.
+        # IMPORTANT: do NOT call self.post_init() here. super().__init__ already
+        # initialized the DETR encoder/decoder/heads, and MultiModalBackbone
+        # loaded pretrained Swin/ResNet weights internally. A second post_init()
+        # would recursively reinitialize every Linear/Conv2d with N(0, 0.02),
+        # destroying the pretrained backbone weights and forcing the model to
+        # train from scratch (which is why mAP stayed at 0 for many epochs).
         self.model.input_projection.apply(self._init_weights)
-        self.post_init()
 
     # ------------------------------------------------------------------ forward
     def forward(
