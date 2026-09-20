@@ -1,8 +1,8 @@
 """RGB + Infrared + Depth multimodal detection dataset and augmentations.
 
 Directory layout under data_root (per spec):
-    rgb/<stem>.{jpg|png}       3-channel 8-bit visible
-    ir/<stem>.{jpg|png}        3-channel 8-bit thermal (stacked single channel)
+    visible/<stem>.{jpg|png}   3-channel 8-bit visible (RGB)
+    infrared/<stem>.{jpg|png}  3-channel 8-bit thermal (stacked single channel)
     depth/<stem>.png           1-channel 16-bit mm
     labels/<stem>.txt          [cls, cx, cy, w, h] normalized
     splits/<split>.txt         one stem per line (optional)
@@ -102,8 +102,8 @@ class MultiModalDataset(Dataset):
         self.train = train
         self.num_classes = num_classes
 
-        self.rgb_dir = os.path.join(data_root, "rgb")
-        self.ir_dir = os.path.join(data_root, "ir")
+        self.rgb_dir = os.path.join(data_root, "visible")
+        self.ir_dir = os.path.join(data_root, "infrared")
         self.depth_dir = os.path.join(data_root, "depth")
         self.label_dir = os.path.join(data_root, "labels")
 

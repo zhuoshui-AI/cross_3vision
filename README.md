@@ -76,8 +76,8 @@ Set `data.data_root` in the config (or pass `--data-root`). Expected under it:
 
 ```
 <data_root>/
-├─ rgb/<stem>.{jpg|png}        # 3-ch 8-bit visible
-├─ ir/<stem>.{jpg|png}         # 3-ch 8-bit thermal (the 1st channel is taken)
+├─ visible/<stem>.{jpg|png}    # 3-ch 8-bit visible (RGB)
+├─ infrared/<stem>.{jpg|png}   # 3-ch 8-bit thermal (the 1st channel is taken)
 ├─ depth/<stem>.png            # 1-ch 16-bit mm (0 or <10 mm → invalid)
 ├─ labels/<stem>.txt          # `cls cx cy w h` normalized
 └─ splits/{train,val,test}.txt # one stem per line (optional)

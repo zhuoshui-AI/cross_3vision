@@ -84,9 +84,9 @@ def train(cfg, resume=None):
 
         Supports two config styles:
           1) data_root + split_file:  split_key = "splits/train.txt" (relative
-             to data_root); data_root holds rgb/ir/depth/labels subdirs.
+             to data_root); data_root holds visible/infrared/depth/labels subdirs.
           2) split_key = absolute directory path: the directory itself holds
-             rgb/ir/depth/labels; data_root = that dir, split_file = None
+             visible/infrared/depth/labels; data_root = that dir, split_file = None
              (auto-scan labels/). This is how AIC2026 train/test sets are laid
              out — two independent dataset directories.
         """
