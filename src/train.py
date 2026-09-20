@@ -162,7 +162,7 @@ def train(cfg, resume=None):
     amp = bool(tcfg.get("amp", True)) and device == "cuda"
     amp_dtype = torch.bfloat16 if (amp and torch.cuda.is_bf16_supported()) \
         else torch.float16
-    scaler = torch.cuda.amp.GradScaler(enabled=(amp and amp_dtype == torch.float16))
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp and amp_dtype == torch.float16))
     ema_decay = float(tcfg.get("ema_decay", 0.0))
     ema = EMA(model, ema_decay) if ema_decay > 0 else None
 

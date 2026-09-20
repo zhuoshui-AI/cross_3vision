@@ -75,6 +75,16 @@ def load_label(txt_path, num_classes):
                 cx, cy, w, h = (float(v) for v in parts[1:5])
                 x1, y1 = cx - w / 2.0, cy - h / 2.0
                 x2, y2 = cx + w / 2.0, cy + h / 2.0
+                # Boxes hugging the image edge can land a hair outside [0,1]
+                # from float rounding (e.g. -2e-7); albumentations 2.x rejects
+                # these in its strict range check.
+                x1 = min(max(x1, 0.0), 1.0)
+                y1 = min(max(y1, 0.0), 1.0)
+                x2 = min(max(x2, 0.0), 1.0)
+                y2 = min(max(y2, 0.0), 1.0)
+                # Drop degenerate boxes (zero/negative area after clipping).
+                if x2 <= x1 or y2 <= y1:
+                    continue
                 boxes.append([x1, y1, x2, y2])
                 labels.append(cls)
     return (np.array(boxes, dtype=np.float32).reshape(-1, 4),
@@ -172,8 +182,8 @@ class MultiModalDataset(Dataset):
         # Boxes are normalized xyxy; convert to pixel coords for albumentations.
         if len(boxes) > 0:
             boxes_px = boxes.copy()
-            boxes_px[:, [0, 2]] *= W
-            boxes_px[:, [1, 3]] *= H
+            boxes_px[:, [0, 2]] = np.clip(boxes_px[:, [0, 2]] * W, 0, W)
+            boxes_px[:, [1, 3]] = np.clip(boxes_px[:, [1, 3]] * H, 0, H)
             box_list = boxes_px.tolist()
             label_list = class_labels.tolist()
         else:
