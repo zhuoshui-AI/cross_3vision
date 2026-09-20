@@ -171,17 +171,25 @@ class MultiModalDataset(Dataset):
         rgb = np.array(Image.open(find_image(stem, self.rgb_dir)).convert("RGB"))
         ir3 = np.array(Image.open(find_image(stem, self.ir_dir)).convert("RGB"))
         ir = ir3[..., :1]  # 3-channel thermal stack → single channel (spec: visually identical)
-        # Depth files may decode as 'I;16' (1ch, the expected case) or as
-        # 'RGB'/'P' (3ch) depending on how they were saved; force to a single
-        # channel so downstream tensors are always (1, H, W).
+        # Depth in this dataset ships in TWO formats:
+        #   - 16-bit PNG (mode I;16), values in mm with max≈19999 → /20000
+        #   - 8-bit JPG (mode RGB or L), values pre-normalized to [0,255] → /255
+        # Detect by dtype/mode and normalize accordingly so both end up in
+        # roughly [0,1] with the same physical meaning.
         depth_img = Image.open(find_image(stem, self.depth_dir))
-        if depth_img.mode not in ("I", "I;16", "L"):
-            depth_img = depth_img.convert("L")
-        depth = np.array(depth_img).astype(np.float32)
-        if depth.ndim == 2:
-            depth = depth[..., None]
-        elif depth.ndim == 3 and depth.shape[-1] != 1:
-            depth = depth[..., :1]
+        depth_mode = depth_img.mode
+        if depth_mode == "I;16" or depth_mode == "I":
+            # 16-bit mm. Keep original dtype to read true uint16 values.
+            depth = np.array(depth_img).astype(np.float32)
+            depth = depth[..., None] if depth.ndim == 2 else depth[..., :1]
+            depth_is_mm = True
+        else:
+            # 8-bit pre-normalized (JPG or 8-bit PNG). Force to single channel.
+            if depth_mode not in ("L",):
+                depth_img = depth_img.convert("L")
+            depth = np.array(depth_img).astype(np.float32)
+            depth = depth[..., None] if depth.ndim == 2 else depth[..., :1]
+            depth_is_mm = False
 
         boxes, class_labels = load_label(
             os.path.join(self.label_dir, stem + ".txt"), self.num_classes)
@@ -225,7 +233,7 @@ class MultiModalDataset(Dataset):
 
         pixel_rgb = self._normalize_rgb(rgb_t)
         pixel_ir = self._normalize_ir(ir_t)
-        pixel_depth, depth_mask = self._normalize_depth(depth_t)
+        pixel_depth, depth_mask = self._normalize_depth(depth_t, depth_is_mm)
 
         target = {
             "class_labels": torch.from_numpy(labels_aug).long(),
@@ -255,11 +263,22 @@ class MultiModalDataset(Dataset):
         return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))).float()
 
     @staticmethod
-    def _normalize_depth(depth_hwc):
-        # uint16 mm → [0,1]. Spec: 0 or too small = invalid; range [0, 19999]mm.
+    def _normalize_depth(depth_hwc, is_mm=True):
+        """Normalize depth to [0,1] and produce a validity mask.
+
+        Two input formats coexist in this dataset:
+          - 16-bit mm PNG (is_mm=True):  range [0, 19999] mm, invalid if <10 or >20000.
+          - 8-bit pre-normalized JPG (is_mm=False): range [0, 255], no mm
+            semantics; treat 0 as invalid but keep the rest.
+        Both produce a (1, H, W) float tensor in ~[0,1] and a (H, W) bool mask.
+        """
         x = depth_hwc.astype(np.float32)
-        valid = (x >= 10.0) & (x <= 20000.0)
-        x = np.clip(x, 0.0, 20000.0) / 20000.0
+        if is_mm:
+            valid = (x >= 10.0) & (x <= 20000.0)
+            x = np.clip(x, 0.0, 20000.0) / 20000.0
+        else:
+            valid = x > 0.0
+            x = x / 255.0
         x[~valid] = 0.0
         tensor = torch.from_numpy(
             np.ascontiguousarray(x.transpose(2, 0, 1))).float()
