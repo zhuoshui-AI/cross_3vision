@@ -123,11 +123,34 @@ class MultiModalDataset(Dataset):
             with open(split_file, "r") as fh:
                 self.ids = [ln.strip() for ln in fh if ln.strip()]
         else:
-            self.ids = sorted(
+            # Scan labels/ for stems, then keep only those where all 3
+            # modality files actually exist. Stray depth-only slices
+            # (e.g. "000002_080_00000048") have no labels and are dropped
+            # automatically; samples with a label but a missing modality
+            # are also dropped here to avoid FileNotFoundError in __getitem__.
+            import logging
+            logger = logging.getLogger(__name__)
+            candidates = sorted(
                 os.path.splitext(f)[0]
                 for f in os.listdir(self.label_dir)
                 if f.endswith(".txt")
             )
+            kept, dropped = [], []
+            for stem in candidates:
+                ok = True
+                for d in (self.rgb_dir, self.ir_dir, self.depth_dir):
+                    try:
+                        find_image(stem, d)
+                    except FileNotFoundError:
+                        ok = False
+                        break
+                (kept if ok else dropped).append(stem)
+            if dropped:
+                logger.warning(
+                    "Dropped %d/%d samples missing one or more "
+                    "modalities (first few: %s)",
+                    len(dropped), len(candidates), dropped[:5])
+            self.ids = kept
 
         self.transform = self._build_transform(train)
 
@@ -213,6 +236,15 @@ class MultiModalDataset(Dataset):
         ir_t = data["ir"]
         depth_t = data["depth"]
         H2, W2 = rgb_t.shape[:2]
+        # Albumentations may broadcast a single-channel "image" to 3 channels
+        # depending on version/interpolation; force IR and depth back to a
+        # single channel so downstream tensors are always (1, H, W).
+        if ir_t.ndim == 3 and ir_t.shape[-1] != 1:
+            ir_t = ir_t[..., :1]
+        if depth_t.ndim == 3 and depth_t.shape[-1] != 1:
+            depth_t = depth_t[..., :1]
+        elif depth_t.ndim == 2:
+            depth_t = depth_t[..., None]
 
         boxes_aug = np.array(data["bboxes"], dtype=np.float32).reshape(-1, 4)
         labels_aug = np.array(data["class_labels"], dtype=np.int64)
