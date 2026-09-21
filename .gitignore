@@ -24,3 +24,4 @@ outputs/
 # ---- OS ----
 Thumbs.db
 .DS_Store
+example_data/
