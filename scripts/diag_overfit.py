@@ -144,9 +144,48 @@ def main():
                       f"p50_non_eos={float(s_ne.median()):.3f} "
                       f"({time.time()-t0:.0f}s)", flush=True)
 
+    # ---- Mode-divergence probe: compare TRAIN vs EVAL on the same batch.
+    # If eval queries collapse but train queries don't, some module behaves
+    # differently by mode (BatchNorm/Dropout/DropPath). Hook the fused
+    # backbone feature to see whether collapse starts in the backbone.
+    captured = {}
+
+    def _hook(module, inp, outp):
+        # MultiModalBackbone returns [(f_enh, mask)]
+        captured["f"] = outp[0][0].detach()
+
+    handle = model.model.backbone.conv_encoder.register_forward_hook(_hook)
+
+    def _mode_stats(mode):
+        model.train(mode)
+        with torch.no_grad():
+            o = model(**batch)
+        f = captured["f"]  # (B, C, h, w)
+        # spatial variation of backbone features (per-image mean over channels
+        # of the std across HW tokens): ~0 means the feature map collapsed.
+        f_spatial_std = float(f.flatten(2).std(dim=2).mean())
+        # query diversity: std of predicted boxes across the 100 queries
+        box_std = float(o.pred_boxes.std(dim=1).mean())
+        # number of distinct box modes (rounded to 2px) on image 0
+        b0 = (o.pred_boxes[0] * args.img_size).round().tolist()
+        n_modes = len({tuple(round(v, 0) for v in row) for row in b0})
+        return f_spatial_std, box_std, n_modes, o
+
+    f_tr, b_tr, m_tr, _ = _mode_stats(True)
+    f_ev, b_ev, m_ev, out = _mode_stats(False)
+    handle.remove()
+    print(f"[probe] TRAIN: feat_spatial_std={f_tr:.4f} box_std={b_tr:.4f} "
+          f"unique_box_modes(img0)={m_tr}", flush=True)
+    print(f"[probe] EVAL : feat_spatial_std={f_ev:.4f} box_std={b_ev:.4f} "
+          f"unique_box_modes(img0)={m_ev}", flush=True)
+    if f_ev < 1e-3 and f_tr >= 1e-3:
+        print("[probe] >>> backbone FEATURES collapse only in EVAL "
+              "=> norm/mode bug in a backbone branch", flush=True)
+    elif f_ev >= 1e-3 and m_ev <= 2:
+        print("[probe] >>> features fine but DECODER queries collapse "
+              "=> check decoder/query wiring", flush=True)
+
     model.eval()
-    with torch.no_grad():
-        out = model(**batch)
     probs = out.logits.softmax(-1)
     scores, labels_pred = probs[..., :-1].max(-1)
     preds, targets = [], []

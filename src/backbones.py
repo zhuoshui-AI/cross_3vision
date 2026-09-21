@@ -22,6 +22,20 @@ def _conv_bn_act(in_c, out_c, k=3, s=2, p=1):
     )
 
 
+def _group_norm(channels, groups=32):
+    """GroupNorm with a group count that always divides `channels`.
+
+    GroupNorm replaces BatchNorm in the IR backbone so that behaviour is
+    IDENTICAL in train/eval (BN switches batch-stats ↔ running-stats, which is
+    catastrophic here: conv1 was summed 3ch→1ch but bn1 kept 3ch ImageNet
+    running stats, and per-GPU batch size is small).
+    """
+    g = groups
+    while channels % g != 0 and g > 1:
+        g -= 1
+    return nn.GroupNorm(g, channels)
+
+
 def convert_msft_swin_to_timm(state):
     """Remap official Microsoft Swin checkpoint keys to modern timm layout.
 
@@ -51,7 +65,7 @@ class SwinRGBBackbone(nn.Module):
 
     def __init__(self, variant="swin_small_patch4_window7_224_22k",
                  pretrained=True, pretrained_path=None, freeze_stages=2,
-                 img_size=512, pretrained_tag="ms_in22k"):
+                 img_size=512, pretrained_tag="ms_in22k", drop_path_rate=0.0):
         super().__init__()
         import os
         path_ok = bool(pretrained_path) and os.path.isfile(pretrained_path)
@@ -66,6 +80,9 @@ class SwinRGBBackbone(nn.Module):
         if pretrained_tag and kwargs.get("pretrained"):
             # e.g. "ms_in22k" → ImageNet-22k weights (user's stated requirement).
             kwargs["pretrained_cfg"] = pretrained_tag
+        # drop_path_rate=0 keeps train/eval forward identical (timm's default
+        # for swin_small is 0.3, which adds stochastic residual drops).
+        kwargs["drop_path_rate"] = float(drop_path_rate)
         # Pass img_size so Swin precomputes its window-attention mask for the
         # real training/inference resolution (the mask is resolution-locked).
         try:
@@ -73,6 +90,7 @@ class SwinRGBBackbone(nn.Module):
         except TypeError:
             # Older timm without img_size kwarg support.
             kwargs.pop("pretrained_cfg", None)
+            kwargs.pop("drop_path_rate", None)
             self.swin = timm.create_model(variant, **kwargs)
         if path_ok:
             import logging
@@ -136,6 +154,26 @@ class SwinRGBBackbone(nn.Module):
                 for p in layer.parameters():
                     p.requires_grad = False
 
+    def train(self, mode=True):
+        """Frozen stages stay in eval() even during training.
+
+        model.train() flips every submodule to train mode; that would silently
+        re-enable dropout/DropPath inside FROZEN stages, feeding stochastic
+        features into the trainable stages while eval runs them clean — a
+        train/eval distribution mismatch. Pin frozen submodules to eval.
+        """
+        super().train(mode)
+        if mode and self.freeze_stages >= 1:
+            self.swin.patch_embed.eval()
+            if hasattr(self.swin, "pos_drop"):
+                self.swin.pos_drop.eval()
+            if hasattr(self.swin, "norm_pre"):
+                self.swin.norm_pre.eval()
+            for i, layer in enumerate(self.swin.layers):
+                if i < self.freeze_stages:
+                    layer.eval()
+        return self
+
     def forward(self, x):
         """x: (B, 3, H, W) ImageNet-normalized. Returns (B, C, H/32, W/32)."""
         B, _, H, W = x.shape
@@ -176,9 +214,19 @@ class IRBackbone(nn.Module):
             self.backbone = _AnyThermalAdapter(anythermal_path, out_dim=out_dim)
             self.in_channels = self.backbone.out_channels
         elif variant == "resnet50_imagenet_1ch":
-            rn = torchvision.models.resnet50(weights="IMAGENET1K_V2" if not pretrained_path else None)
+            # Build with GroupNorm everywhere (no train/eval mode switch), then
+            # copy the pretrained BN affine params (γ/β share the same key
+            # names); running_mean/var and num_batches_tracked are discarded.
+            rn = torchvision.models.resnet50(
+                weights=None, norm_layer=_group_norm)
             if pretrained_path:
-                rn.load_state_dict(torch.load(pretrained_path, map_location="cpu"), strict=False)
+                state = torch.load(pretrained_path, map_location="cpu")
+                rn.load_state_dict(state, strict=False)
+            else:
+                # Online V2 weights ship as BN tensors; same γ/β copy applies.
+                rn_bn = torchvision.models.resnet50(weights="IMAGENET1K_V2")
+                rn.load_state_dict(rn_bn.state_dict(), strict=False)
+                del rn_bn
             # Adapt conv1 from 3ch→1ch by summing weights across input channels.
             with torch.no_grad():
                 new_w = rn.conv1.weight.sum(dim=1, keepdim=True)  # (64, 1, 7, 7)

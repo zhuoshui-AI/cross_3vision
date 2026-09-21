@@ -17,6 +17,7 @@ model:
   swin_variant: "swin_small_patch4_window7_224"   # timm name (new timm dropped the _22k suffix; ImageNet-22k weights come via pretrained=True / pretrained_path)
   swin_out_stage: 3                                   # 取 stage3 (stride 32)
   swin_freeze_stages: 2                               # 前 2 stage 冻结
+  swin_drop_path_rate: 0.0                            # 0 = 关闭 DropPath，保证 train/eval 前向一致（小数据集更稳）
   swin_pretrained: true                              # 训练时从 timm hub 拉权重（构造时默认关闭以免联网）
   swin_pretrained_tag: "ms_in22k"                     # timm tag → ImageNet-22k 权重
   swin_pretrained_path: "./weights/swin_small_patch4_window7_224_22k.pth"  # 离线权重；存在则优先用，不存在则走 hub
@@ -32,6 +33,9 @@ model:
   encoder_layers: 6
   decoder_layers: 6
   auxiliary_loss: true
+  detr_dropout: 0.0                  # 0 = 关闭 DETR dropout，train/eval 前向完全一致
+  detr_attention_dropout: 0.0
+  detr_activation_dropout: 0.0
 
   # Fusion
   cssa_tau: 0.5                 # 通道切换阈值，固定不学

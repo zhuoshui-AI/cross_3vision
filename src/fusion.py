@@ -100,7 +100,7 @@ class DepthLateFusion(nn.Module):
     Placed between the multi-modal backbone output and the DETR encoder.
     """
 
-    def __init__(self, d_model=256, num_heads=8, dropout=0.1, ffn_mult=4):
+    def __init__(self, d_model=256, num_heads=8, dropout=0.0, ffn_mult=4):
         super().__init__()
         self.d_model = d_model
         self.cross_attn = nn.MultiheadAttention(

@@ -70,6 +70,7 @@ class MultiModalBackbone(nn.Module):
             freeze_stages=int(mcfg.get("swin_freeze_stages", 2)),
             img_size=int(cfg["data"]["img_size"]),
             pretrained_tag=mcfg.get("swin_pretrained_tag", "ms_in22k"),
+            drop_path_rate=float(mcfg.get("swin_drop_path_rate", 0.0)),
         )
         swin_dim = self.rgb_backbone.swin_dim
 
@@ -97,6 +98,7 @@ class MultiModalBackbone(nn.Module):
         self.depth_fuse = DepthLateFusion(
             d_model=d_model,
             num_heads=int(mcfg.get("depth_fuse_heads", 8)),
+            dropout=float(mcfg.get("depth_fuse_dropout", 0.0)),
         )
 
         self.d_model = d_model
@@ -312,6 +314,10 @@ def build_detr_config(cfg):
         encoder_layers=int(mcfg["encoder_layers"]),
         decoder_layers=int(mcfg["decoder_layers"]),
         auxiliary_loss=bool(mcfg["auxiliary_loss"]),
+        # Dropout rates (0 keeps train/eval forwards identical; small dataset).
+        dropout=float(mcfg.get("detr_dropout", 0.1)),
+        attention_dropout=float(mcfg.get("detr_attention_dropout", 0.0)),
+        activation_dropout=float(mcfg.get("detr_activation_dropout", 0.0)),
         # Throwaway timm resnet50 — replaced in __init__.
         use_timm_backbone=True,
         backbone="resnet50",
