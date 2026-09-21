@@ -4,7 +4,10 @@ If the code (data -> model -> loss -> eval) is consistent, mAP@50 on the SAME
 images must climb well above 0.1 within a few hundred steps. If it stays ~0,
 the pipeline has a reproducible train/eval inconsistency.
 
-On the server (GPU), 300 steps takes ~1 min.
+On the server (GPU), 400 steps takes ~1-2 min.
+
+AP uses the competition's 101-point interpolation (spec §6) so the numbers
+are directly comparable to the official metric logic.
 
 Usage:
     # use your training data dir (must have labels + 3 modalities)
@@ -70,12 +73,13 @@ def mini_ap(preds, targets, iou_th):
         ctp, cfp = np.cumsum(tp), np.cumsum(fp)
         rec = ctp / max(n_gt, 1)
         prec = ctp / np.maximum(ctp + cfp, 1)
-        mrec = np.concatenate([[0], rec, [1]])
-        mpre = np.concatenate([[1], prec, [0]])
-        for i in range(len(mpre) - 2, -1, -1):
-            mpre[i] = max(mpre[i], mpre[i + 1])
-        idx = np.where(mrec[1:] != mrec[:-1])[0]
-        aps.append(float(np.sum((mrec[idx + 1] - mrec[idx]) * mpre[idx + 1])))
+        # Competition rule (spec §6): 101-point interpolated AP — average, over
+        # r = 0, 0.01, ..., 1, of the max precision at recall >= r.
+        q = np.zeros(101, dtype=np.float64)
+        for i, r in enumerate(np.linspace(0.0, 1.0, 101)):
+            mask = rec >= r
+            q[i] = float(prec[mask].max()) if mask.any() else 0.0
+        aps.append(float(q.mean()))
     return float(np.mean(aps)) if aps else float("nan")
 
 
@@ -163,8 +167,15 @@ def main():
     ap75 = mini_ap(preds, targets, 0.75)
     n_pred = sum(len(p["scores"]) for p in preds)
     n_gt = sum(len(t["labels"]) for t in targets)
+    if n_gt == 0:
+        print(f"\n[overfit] >>> selected {len(ds)} images contain ZERO GT boxes; "
+              f"the overfit test is meaningless (check labels/ dir / id list).",
+              flush=True)
+        sys.exit(1)
     print(f"\n[overfit] preds kept={n_pred} (gt={n_gt})  "
-          f"mini-mAP@50={ap50:.4f}  mini-mAP@75={ap75:.4f}", flush=True)
+          f"mini-AP@50={ap50:.4f}  mini-AP@75={ap75:.4f}  "
+          f"(101-pt interp, {len({int(l) for t in targets for l in t['labels']})} "
+          f"classes present)", flush=True)
     # print first image boxes for visual sanity check
     if preds and targets:
         print(f"[overfit] img0: {len(preds[0]['boxes'])} preds, {len(targets[0]['boxes'])} gts", flush=True)
