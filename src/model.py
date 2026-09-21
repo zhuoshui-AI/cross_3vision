@@ -163,6 +163,19 @@ class MultiModalSwinDETR(DetrForObjectDetection):
         # train from scratch (which is why mAP stayed at 0 for many epochs).
         self.model.input_projection.apply(self._init_weights)
 
+        # DETR foreground-prior bias init (Carion et al. ECCV 2020, §A.4):
+        # set the final classification-layer bias to -log((1-pi)/pi) so the
+        # model initially predicts objects with probability ~pi. Without this,
+        # all 100 queries start at ~1/num_classes confidence for every class,
+        # the Hungarian matcher sees dense false positives, and training
+        # oscillates (ce bounces 0.5<->1.2, giou never converges). pi=0.01
+        # matches the original paper; we keep it class-agnostic.
+        import math
+        prior_prob = 0.01
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        with torch.no_grad():
+            self.class_labels_classifier.bias.fill_(bias_value)
+
     # ------------------------------------------------------------------ forward
     def forward(
         self,

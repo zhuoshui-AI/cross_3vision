@@ -144,10 +144,11 @@ def main():
         targets.append({"boxes": txyxy,
                         "labels": batch["labels"][b]["class_labels"].cpu().numpy()})
 
-    # Same two-param-group AdamW as src/train.py (lr/backbone_lr from config).
-    # A single lr=2e-4 on EVERYTHING wrecks the pretrained Swin/ResNet features
-    # within ~50 steps (giou 1.08 -> 1.65) and leaves the Hungarian matcher
-    # oscillating forever — exactly the signature of the previous run.
+    # Two-param-group AdamW mirroring src/train.py, but with a cosine schedule
+    # (constant LR after warmup caused repeated loss spikes at steps ~300/1000
+    # and prevented convergence on this tiny 8-image batch). Head LR is halved
+    # to 5e-5 to tame the oscillation; backbone stays at 1e-5.
+    import math
     tcfg = cfg.get("train") or {}
     head_params, backbone_params = [], []
     for n, p in model.named_parameters():
@@ -156,17 +157,27 @@ def main():
         is_backbone = any(s in n for s in (
             "rgb_backbone.", "ir_backbone.", "depth_encoder."))
         (backbone_params if is_backbone else head_params).append(p)
+    base_lr = float(tcfg.get("lr", 1e-4)) * 0.5
+    bb_lr = float(tcfg.get("backbone_lr", 1e-5))
     opt = torch.optim.AdamW(
-        [{"params": head_params, "lr": float(tcfg.get("lr", 1e-4))},
-         {"params": backbone_params, "lr": float(tcfg.get("backbone_lr", 1e-5))}],
+        [{"params": head_params, "lr": base_lr},
+         {"params": backbone_params, "lr": bb_lr}],
         weight_decay=float(tcfg.get("weight_decay", 1e-4)), betas=(0.9, 0.999))
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 50))
+    warmup = 50
+    cosine_steps = max(1, args.steps - warmup)
+
+    def lr_lambda(step):
+        if step < warmup:
+            return (step + 1) / max(1, warmup)
+        return 0.5 * (1 + math.cos(math.pi * (step - warmup) / cosine_steps))
+
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_lambda)
     t0 = time.time()
     for step in range(args.steps):
         out = model(**batch)
         opt.zero_grad()
         out.loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         opt.step(); sched.step()
 
         with torch.no_grad():
@@ -181,10 +192,8 @@ def main():
                       f"ce={float(ld['loss_ce']):.3f} "
                       f"wh_std={float(wh.std()):.4f} "
                       f"p50_non_eos={float(s_ne.median()):.3f} "
+                      f"gnorm={float(grad_norm):.2f} "
                       f"({time.time()-t0:.0f}s)", flush=True)
-            # In-loop AP trend (train-mode forward; the probe above proved
-            # train/eval forwards are identical). Shows whether AP climbs or
-            # is stuck while the loss components plateau.
             if step % 100 == 0 or step == args.steps - 1:
                 with torch.no_grad():
                     p_now = decode_preds(out.logits, out.pred_boxes, SZ)
