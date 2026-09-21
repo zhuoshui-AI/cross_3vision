@@ -4,7 +4,7 @@ If the code (data -> model -> loss -> eval) is consistent, mAP@50 on the SAME
 images must climb well above 0.1 within a few hundred steps. If it stays ~0,
 the pipeline has a reproducible train/eval inconsistency.
 
-On the server (GPU), 400 steps takes ~1-2 min.
+On the server (GPU), 1500 steps takes ~5-8 min.
 
 AP uses the competition's 101-point interpolation (spec §6) so the numbers
 are directly comparable to the official metric logic.
@@ -83,12 +83,27 @@ def mini_ap(preds, targets, iou_th):
     return float(np.mean(aps)) if aps else float("nan")
 
 
+def decode_preds(logits, pred_boxes, img_size, conf=0.05):
+    """Softmax (EOS excluded) -> per-image kept preds in pixel xyxy."""
+    probs = logits.softmax(-1)
+    scores, labels = probs[..., :-1].max(-1)
+    preds = []
+    for b in range(logits.shape[0]):
+        keep = scores[b] >= conf
+        bx = pred_boxes[b][keep].cpu().numpy()
+        cx, cy, w, h = bx[:, 0], bx[:, 1], bx[:, 2], bx[:, 3]
+        xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1) * img_size
+        preds.append({"boxes": xyxy, "scores": scores[b][keep].cpu().numpy(),
+                      "labels": labels[b][keep].cpu().numpy()})
+    return preds
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data-root", required=True)
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--n-imgs", type=int, default=8)
-    ap.add_argument("--steps", type=int, default=400)
+    ap.add_argument("--steps", type=int, default=1500)
     ap.add_argument("--img-size", type=int, default=512)
     args = ap.parse_args()
 
@@ -120,8 +135,32 @@ def main():
                                                  "depth_mask", "pixel_mask",
                                                  "labels")}
 
-    opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
-    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 20))
+    SZ = args.img_size
+    targets = []
+    for b in range(len(ds)):
+        tbox = batch["labels"][b]["boxes"].cpu().numpy()
+        cx, cy, w, h = tbox[:, 0], tbox[:, 1], tbox[:, 2], tbox[:, 3]
+        txyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1) * SZ
+        targets.append({"boxes": txyxy,
+                        "labels": batch["labels"][b]["class_labels"].cpu().numpy()})
+
+    # Same two-param-group AdamW as src/train.py (lr/backbone_lr from config).
+    # A single lr=2e-4 on EVERYTHING wrecks the pretrained Swin/ResNet features
+    # within ~50 steps (giou 1.08 -> 1.65) and leaves the Hungarian matcher
+    # oscillating forever — exactly the signature of the previous run.
+    tcfg = cfg.get("train") or {}
+    head_params, backbone_params = [], []
+    for n, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        is_backbone = any(s in n for s in (
+            "rgb_backbone.", "ir_backbone.", "depth_encoder."))
+        (backbone_params if is_backbone else head_params).append(p)
+    opt = torch.optim.AdamW(
+        [{"params": head_params, "lr": float(tcfg.get("lr", 1e-4))},
+         {"params": backbone_params, "lr": float(tcfg.get("backbone_lr", 1e-5))}],
+        weight_decay=float(tcfg.get("weight_decay", 1e-4)), betas=(0.9, 0.999))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 50))
     t0 = time.time()
     for step in range(args.steps):
         out = model(**batch)
@@ -143,6 +182,14 @@ def main():
                       f"wh_std={float(wh.std()):.4f} "
                       f"p50_non_eos={float(s_ne.median()):.3f} "
                       f"({time.time()-t0:.0f}s)", flush=True)
+            # In-loop AP trend (train-mode forward; the probe above proved
+            # train/eval forwards are identical). Shows whether AP climbs or
+            # is stuck while the loss components plateau.
+            if step % 100 == 0 or step == args.steps - 1:
+                with torch.no_grad():
+                    p_now = decode_preds(out.logits, out.pred_boxes, SZ)
+                print(f"         -> mini-AP@50 = "
+                      f"{mini_ap(p_now, targets, 0.5):.4f} (in-loop)", flush=True)
 
     # ---- Mode-divergence probe: compare TRAIN vs EVAL on the same batch.
     # If eval queries collapse but train queries don't, some module behaves
@@ -186,22 +233,7 @@ def main():
               "=> check decoder/query wiring", flush=True)
 
     model.eval()
-    probs = out.logits.softmax(-1)
-    scores, labels_pred = probs[..., :-1].max(-1)
-    preds, targets = [], []
-    SZ = args.img_size
-    for b in range(len(ds)):
-        keep = scores[b] >= 0.05
-        bx = out.pred_boxes[b][keep].cpu().numpy()
-        cx, cy, w, h = bx[:, 0], bx[:, 1], bx[:, 2], bx[:, 3]
-        xyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1) * SZ
-        preds.append({"boxes": xyxy, "scores": scores[b][keep].cpu().numpy(),
-                      "labels": labels_pred[b][keep].cpu().numpy()})
-        tbox = batch["labels"][b]["boxes"].cpu().numpy()
-        cx, cy, w, h = tbox[:, 0], tbox[:, 1], tbox[:, 2], tbox[:, 3]
-        txyxy = np.stack([cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2], 1) * SZ
-        targets.append({"boxes": txyxy,
-                        "labels": batch["labels"][b]["class_labels"].cpu().numpy()})
+    preds = decode_preds(out.logits, out.pred_boxes, SZ)
     ap50 = mini_ap(preds, targets, 0.5)
     ap75 = mini_ap(preds, targets, 0.75)
     n_pred = sum(len(p["scores"]) for p in preds)
