@@ -94,32 +94,32 @@ def main():
     cfg["data"]["img_size"] = args.img_size
 
     ds = MultiModalDataset(data_root=args.data_root, split_file=None,
-                           img_size=args.img_size, train=True,
+                           img_size=args.img_size, train=False,
                            num_classes=int(cfg["model"]["num_labels"]))
     ds.ids = ds.ids[:args.n_imgs]
-    print(f"[overfit] {len(ds)} imgs @ {args.img_size}px on {device}", flush=True)
+    print(f"[overfit] {len(ds)} imgs @ {args.img_size}px on {device} (train=False, fixed data)", flush=True)
 
     model = build_model(cfg).to(device)
     n_p = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"[overfit] trainable params: {n_p/1e6:.1f}M", flush=True)
 
+    # Pre-cache a FIXED batch (train=False => deterministic Resize only) so
+    # the model can truly memorize these 8 images.
+    items = [ds[i] for i in range(len(ds))]
+    batch = collate_fn(items)
+    batch = {k: (v.to(device) if torch.is_tensor(v) else
+                 [{"class_labels": t["class_labels"].to(device),
+                   "boxes": t["boxes"].to(device)} for t in v])
+             for k, v in batch.items() if k in ("pixel_values_rgb",
+                                                 "pixel_values_ir",
+                                                 "pixel_values_depth",
+                                                 "depth_mask", "pixel_mask",
+                                                 "labels")}
+
     opt = torch.optim.AdamW(model.parameters(), lr=2e-4, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.LambdaLR(opt, lambda s: min(1.0, (s + 1) / 20))
     t0 = time.time()
     for step in range(args.steps):
-        # rebuild one big batch from all images each step (no augmentation in
-        # train transform here, but let's be explicit: use train=True so the
-        # real training pipeline is exercised, including RandomResizedCrop).
-        items = [ds[i] for i in range(len(ds))]
-        batch = collate_fn(items)
-        batch = {k: (v.to(device) if torch.is_tensor(v) else
-                     [{"class_labels": t["class_labels"].to(device),
-                       "boxes": t["boxes"].to(device)} for t in v])
-                 for k, v in batch.items() if k in ("pixel_values_rgb",
-                                                     "pixel_values_ir",
-                                                     "pixel_values_depth",
-                                                     "depth_mask", "pixel_mask",
-                                                     "labels")}
         out = model(**batch)
         opt.zero_grad()
         out.loss.backward()
@@ -142,16 +142,6 @@ def main():
 
     model.eval()
     with torch.no_grad():
-        items = [ds[i] for i in range(len(ds))]
-        batch = collate_fn(items)
-        batch = {k: (v.to(device) if torch.is_tensor(v) else
-                     [{"class_labels": t["class_labels"].to(device),
-                       "boxes": t["boxes"].to(device)} for t in v])
-                 for k, v in batch.items() if k in ("pixel_values_rgb",
-                                                     "pixel_values_ir",
-                                                     "pixel_values_depth",
-                                                     "depth_mask", "pixel_mask",
-                                                     "labels")}
         out = model(**batch)
     probs = out.logits.softmax(-1)
     scores, labels_pred = probs[..., :-1].max(-1)
@@ -175,6 +165,13 @@ def main():
     n_gt = sum(len(t["labels"]) for t in targets)
     print(f"\n[overfit] preds kept={n_pred} (gt={n_gt})  "
           f"mini-mAP@50={ap50:.4f}  mini-mAP@75={ap75:.4f}", flush=True)
+    # print first image boxes for visual sanity check
+    if preds and targets:
+        print(f"[overfit] img0: {len(preds[0]['boxes'])} preds, {len(targets[0]['boxes'])} gts", flush=True)
+        print(f"  GT   boxes(xyxy px): {np.round(targets[0]['boxes'][:5], 1).tolist()}", flush=True)
+        print(f"  PRED boxes(xyxy px): {np.round(preds[0]['boxes'][:5], 1).tolist()}", flush=True)
+        print(f"  GT   classes: {targets[0]['labels'].tolist()}", flush=True)
+        print(f"  PRED classes: {preds[0]['labels'][:5].tolist()}", flush=True)
     if ap50 < 0.05:
         print("[overfit] >>> mAP stays ~0 even overfitting => REPRODUCIBLE bug", flush=True)
     else:
