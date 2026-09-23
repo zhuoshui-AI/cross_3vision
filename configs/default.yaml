@@ -13,6 +13,29 @@ data:
 
 # ---- Model ----
 model:
+  # 架构开关：tri_swin = TMSC-Det（三 Swin + HCMAF + FPN）；cssa_detr = 旧结构
+  arch: "tri_swin"
+
+  # ---- TMSC-Det (tri_swin) Lite 配置：三路全部 Swin-T ----
+  tri_rgb_variant: "swin_tiny_patch4_window7_224"
+  tri_ir_variant: "swin_tiny_patch4_window7_224"
+  tri_depth_variant: "swin_tiny_patch4_window7_224"
+  tri_pretrained_tag: "ms_in22k"          # timm ImageNet-22k 权重标签
+  tri_rgb_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
+  tri_ir_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
+  tri_depth_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
+  tri_freeze_stages: 2                    # RGB/IR 冻结前 2 stage
+  tri_depth_freeze_stages: 1              # Depth 只冻 1 stage（几何模态差异大）
+  tri_fuse_stages: [2, 3, 4]              # 在 stage2/3/4（stride 8/16/32）做 HCMAF
+  tri_window_size: 8                      # 联合窗口注意力窗大小（特征尺度均被 8 整除）
+  tri_modality_dropout: 0.1               # 训练随机遮蔽整路模态，提升单模退化鲁棒性
+  tri_drop_path_rate: 0.0
+  tri_fpn_scales: [8, 16, 32]             # FPN 输出 P3/P4/P5（供参考，实际由 fuse_stages 决定）
+  # DETR encoder 只吃 P4/P5（共 1280 token@512）；FPN 含 PAN 自底向上通路，
+  # P3 的小目标细节会汇入 P4/P5，HCMAF 各级门控均能收到梯度
+  tri_encoder_scales: [16, 32]
+  # 显存充裕（≥40GB）可改 [8, 16, 32] 让 encoder 直接看 P3（约 5376 token，显存随平方增长）
+
   # RGB backbone (Swin Transformer, ImageNet-22k pretrained)
   swin_variant: "swin_small_patch4_window7_224"   # timm name (new timm dropped the _22k suffix; ImageNet-22k weights come via pretrained=True / pretrained_path)
   swin_out_stage: 3                                   # 取 stage3 (stride 32)

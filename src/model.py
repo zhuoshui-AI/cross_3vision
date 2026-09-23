@@ -32,8 +32,9 @@ import torch.nn.functional as F
 from transformers import DetrConfig, DetrForObjectDetection
 from transformers.models.detr.modeling_detr import DetrObjectDetectionOutput
 
-from .backbones import SwinRGBBackbone, IRBackbone, DepthEncoder
-from .fusion import CSSAFusion, DepthLateFusion
+from .backbones import (
+    SwinRGBBackbone, IRBackbone, DepthEncoder, SwinModalityBackbone)
+from .fusion import CSSAFusion, DepthLateFusion, HCMAFBlock, SimpleFPN
 
 
 class MultiModalBackbone(nn.Module):
@@ -307,6 +308,288 @@ class MultiModalSwinDETR(DetrForObjectDetection):
                 p.requires_grad = True
 
 
+class TriModalSwinFusion(nn.Module):
+    """Three per-modality Swin towers + per-scale HCMAF + FPN.
+
+    Pipeline:
+      RGB (3ch)   ─┐
+      IR  (1ch)   ─┼─ Swin stage i ── HCMAF block (fused stages only) ── next stage
+      Depth (2ch) ─┘
+    Fused maps at fuse stages (default stages 2/3/4 → stride 8/16/32) go
+    through SimpleFPN → P3/P4/P5 at d_model channels.
+
+    Submodule attribute names (rgb_backbone / ir_backbone / depth_encoder)
+    match train.py's backbone-vs-head parameter-group name matching.
+    """
+
+    def __init__(self, cfg):
+        super().__init__()
+        mcfg = cfg["model"]
+        img_size = int(cfg["data"]["img_size"])
+        self.d_model = int(mcfg["d_model"])
+        tag = mcfg.get("tri_pretrained_tag", mcfg.get("swin_pretrained_tag", "ms_in22k"))
+        pretrained = bool(mcfg.get("tri_pretrained", mcfg.get("swin_pretrained", True)))
+        drop_path = float(mcfg.get("tri_drop_path_rate",
+                                   mcfg.get("swin_drop_path_rate", 0.0)))
+
+        def _path(key):
+            v = mcfg.get(key)
+            return v if v else None
+
+        common = dict(pretrained=pretrained, pretrained_tag=tag,
+                      img_size=img_size, drop_path_rate=drop_path)
+        self.rgb_backbone = SwinModalityBackbone(
+            variant=mcfg.get("tri_rgb_variant", "swin_tiny_patch4_window7_224"),
+            in_chans=3,
+            pretrained_path=_path("tri_rgb_pretrained_path"),
+            freeze_stages=int(mcfg.get("tri_freeze_stages", 2)), **common)
+        self.ir_backbone = SwinModalityBackbone(
+            variant=mcfg.get("tri_ir_variant", "swin_tiny_patch4_window7_224"),
+            in_chans=1,
+            pretrained_path=_path("tri_ir_pretrained_path"),
+            freeze_stages=int(mcfg.get("tri_freeze_stages", 2)), **common)
+        # Depth is a geometric modality: freeze fewer stages so the 2ch-adapted
+        # stem can adapt faster.
+        self.depth_encoder = SwinModalityBackbone(
+            variant=mcfg.get("tri_depth_variant", "swin_tiny_patch4_window7_224"),
+            in_chans=2,
+            pretrained_path=_path("tri_depth_pretrained_path"),
+            freeze_stages=int(mcfg.get("tri_depth_freeze_stages", 1)), **common)
+
+        embed_dim = self.rgb_backbone.embed_dim
+        self._branches = (self.rgb_backbone, self.ir_backbone, self.depth_encoder)
+        self.fuse_stage_idx = sorted(
+            int(s) - 1 for s in mcfg.get("tri_fuse_stages", [2, 3, 4]))
+        if not self.fuse_stage_idx:
+            raise ValueError("tri_fuse_stages must contain at least one stage")
+        window = int(mcfg.get("tri_window_size", 8))
+        mdrop = float(mcfg.get("tri_modality_dropout", 0.1))
+        self.fusers = nn.ModuleDict({
+            str(i): HCMAFBlock(
+                dim=embed_dim * (2 ** i),
+                num_heads=embed_dim * (2 ** i) // 32,
+                window_size=window, modality_dropout=mdrop)
+            for i in self.fuse_stage_idx})
+        fpn_in = [embed_dim * (2 ** i) for i in self.fuse_stage_idx]
+        self.fpn = SimpleFPN(fpn_in, self.d_model)
+        self.fpn_strides = [4 * (2 ** i) for i in self.fuse_stage_idx]
+        self.encoder_strides = [int(s) for s in mcfg.get(
+            "tri_encoder_scales", [16, 32])]
+        unknown = set(self.encoder_strides) - set(self.fpn_strides)
+        if unknown:
+            raise ValueError(
+                f"tri_encoder_scales {unknown} not in fused FPN strides "
+                f"{self.fpn_strides}")
+
+    @staticmethod
+    def _pixel_mask_down(mask, hw):
+        if mask is None:
+            return None
+        return F.interpolate(mask[None].float(), size=hw).to(torch.bool)[0]
+
+    def forward(self, rgb, ir, depth, depth_mask, pixel_mask=None):
+        depth_in = torch.cat(
+            [depth, depth_mask.float().unsqueeze(1)], dim=1)  # (B,2,H,W)
+        # All three towers run on NHWC maps up to the fusion points.
+        maps = [bb.stem_maps(x)
+                for bb, x in zip(self._branches, (rgb, ir, depth_in))]
+        B = rgb.shape[0]
+        H, W = rgb.shape[-2:]
+
+        fused_by_stage = {}
+        for i in range(4):
+            maps = [bb.run_stage(i, m)
+                    for bb, m in zip(self._branches, maps)]
+            if i in self.fuse_stage_idx:
+                h, w = H // (4 * 2 ** i), W // (4 * 2 ** i)
+                nchw_maps = [SwinModalityBackbone.nhwc_to_nchw(m)
+                             for m in maps]
+                vis = self._pixel_mask_down(pixel_mask, (h, w))
+                if vis is None:
+                    vis = torch.ones((B, h, w), dtype=torch.bool,
+                                     device=rgb.device)
+                # Depth holes mask depth KEY tokens only; RGB/IR always valid.
+                depth_vis = DepthEncoder.downsample_mask(depth_mask, (h, w)) & vis
+                key_valid = [vis, vis, depth_vis]
+                fused, z_maps, _ = self.fusers[str(i)](nchw_maps, key_valid)
+                fused_by_stage[i] = fused
+                # HCMAF outputs per-modality refined features: feed them back
+                # into each tower's next stage.
+                maps = [SwinModalityBackbone.nchw_to_nhwc(z)
+                        for z in z_maps]
+
+        feats = [fused_by_stage[i] for i in self.fuse_stage_idx]
+        pyramids = self.fpn(feats)                    # high-res → low-res
+        masks = [self._pixel_mask_down(pixel_mask, f.shape[-2:])
+                 if pixel_mask is not None
+                 else torch.ones((B, f.shape[2], f.shape[3]),
+                                 dtype=torch.bool, device=f.device)
+                 for f in pyramids]
+        return pyramids, masks, self.fpn_strides
+
+
+class TriModalSwinDETR(DetrForObjectDetection):
+    """Three Swin towers + HCMAF + multi-scale FPN feeding the HF DETR head.
+
+    Only P-scales listed in `tri_encoder_scales` are flattened into DETR
+    encoder tokens; all FPN levels still interact via the top-down path, so
+    e.g. P3's fine detail reaches the encoder through P4. Matcher, losses and
+    heads are inherited unchanged; the forward signature mirrors
+    MultiModalSwinDETR so train/eval/inference work unmodified.
+    """
+
+    def __init__(self, config: DetrConfig, cfg=None):
+        super().__init__(config)
+        self.loss_type = "ForObjectDetection"
+        if cfg is None:
+            raise ValueError("TriModalSwinDETR needs the run config `cfg`.")
+        self.tri_backbone = TriModalSwinFusion(cfg)
+        self.encoder_stride_set = set(self.tri_backbone.encoder_strides)
+        self.scale_embed = nn.Embedding(
+            len(self.tri_backbone.encoder_strides), config.d_model)
+        nn.init.normal_(self.scale_embed.weight, std=0.02)
+        # The HF DETR constructor built a throwaway timm resnet50 + 1x1
+        # projection for DetrConvModel. We drive the encoder manually and
+        # never call them; replace with Identity so their random-init
+        # parameters don't enter the optimizer or the checkpoint. The sine
+        # position_embedding (self.model.backbone.position_embedding) is
+        # kept and reused in forward().
+        self.model.backbone.conv_encoder = nn.Identity()
+        self.model.input_projection = nn.Identity()
+        # No post_init(): see MultiModalSwinDETR for why a second init would
+        # destroy pretrained backbone weights.
+        import math
+        prior_prob = 0.01
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        with torch.no_grad():
+            self.class_labels_classifier.bias.fill_(bias_value)
+
+    def forward(
+        self,
+        pixel_values_rgb,
+        pixel_values_ir,
+        pixel_values_depth,
+        depth_mask,
+        pixel_mask=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        output_attentions = (output_attentions if output_attentions is not None
+                             else self.config.output_attentions)
+        output_hidden_states = (output_hidden_states if output_hidden_states is not None
+                                else self.config.output_hidden_states)
+        return_dict = (return_dict if return_dict is not None
+                       else self.config.use_return_dict)
+
+        device = pixel_values_rgb.device
+        batch_size = pixel_values_rgb.shape[0]
+        if pixel_mask is None:
+            pixel_mask = torch.ones(
+                (batch_size, pixel_values_rgb.shape[2], pixel_values_rgb.shape[3]),
+                dtype=torch.bool, device=device)
+
+        pyramids, fpn_masks, strides = self.tri_backbone(
+            pixel_values_rgb, pixel_values_ir, pixel_values_depth,
+            depth_mask, pixel_mask)
+
+        embeds, attn_masks, poses = [], [], []
+        scale_idx = 0
+        # DETR's DetrConvModel normally computes per-map sine embeddings; its
+        # position_embedding module is map-shape agnostic, so reuse it here.
+        pos_embedder = self.model.backbone.position_embedding
+        for fmap, mask, stride in zip(pyramids, fpn_masks, strides):
+            if stride not in self.encoder_stride_set:
+                continue
+            pos = pos_embedder(fmap, mask)
+            pos = pos + self.scale_embed.weight[scale_idx].view(1, -1, 1, 1)
+            scale_idx += 1
+            embeds.append(fmap.flatten(2).permute(0, 2, 1))
+            attn_masks.append(mask.flatten(1))
+            poses.append(pos.flatten(2).permute(0, 2, 1))
+        flattened = torch.cat(embeds, dim=1)
+        flattened_mask = torch.cat(attn_masks, dim=1)
+        object_queries = torch.cat(poses, dim=1)
+
+        encoder_outputs = self.model.encoder(
+            inputs_embeds=flattened,
+            attention_mask=flattened_mask,
+            object_queries=object_queries,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        query_pos = self.model.query_position_embeddings.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1)
+        queries = torch.zeros_like(query_pos)
+        decoder_outputs = self.model.decoder(
+            inputs_embeds=queries,
+            attention_mask=None,
+            object_queries=object_queries,
+            query_position_embeddings=query_pos,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=flattened_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = decoder_outputs[0]
+        logits = self.class_labels_classifier(sequence_output)
+        pred_boxes = self.bbox_predictor(sequence_output).sigmoid()
+
+        loss, loss_dict, auxiliary_outputs = None, None, None
+        if labels is not None:
+            outputs_class, outputs_coord = None, None
+            if self.config.auxiliary_loss:
+                intermediate = (decoder_outputs.intermediate_hidden_states
+                                if return_dict else decoder_outputs[4])
+                outputs_class = self.class_labels_classifier(intermediate)
+                outputs_coord = self.bbox_predictor(intermediate).sigmoid()
+            loss, loss_dict, auxiliary_outputs = self.loss_function(
+                logits, labels, device, pred_boxes, self.config,
+                outputs_class, outputs_coord)
+
+        if not return_dict:
+            if auxiliary_outputs is not None:
+                output = (logits, pred_boxes) + auxiliary_outputs + decoder_outputs + encoder_outputs
+            else:
+                output = (logits, pred_boxes) + decoder_outputs + encoder_outputs
+            return ((loss, loss_dict) + output) if loss is not None else output
+
+        return DetrObjectDetectionOutput(
+            loss=loss,
+            loss_dict=loss_dict,
+            logits=logits,
+            pred_boxes=pred_boxes,
+            auxiliary_outputs=auxiliary_outputs,
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+    def freeze_backbone(self):
+        """Freeze the three modality Swin towers (fusion + FPN + head train)."""
+        for sub in (self.tri_backbone.rgb_backbone,
+                    self.tri_backbone.ir_backbone,
+                    self.tri_backbone.depth_encoder):
+            for p in sub.parameters():
+                p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        for sub in (self.tri_backbone.rgb_backbone,
+                    self.tri_backbone.ir_backbone,
+                    self.tri_backbone.depth_encoder):
+            for p in sub.parameters():
+                p.requires_grad = True
+
+
 def build_detr_config(cfg):
     """Construct a DetrConfig from the run config.
 
@@ -350,7 +633,12 @@ def build_detr_config(cfg):
 
 
 def build_model(cfg):
-    """Factory: DetrConfig → MultiModalSwinDETR."""
+    """Factory: DetrConfig → detection model, selected by model.arch."""
     config = build_detr_config(cfg)
-    model = MultiModalSwinDETR(config, cfg=cfg)
-    return model
+    arch = cfg["model"].get("arch", "cssa_detr")
+    if arch == "tri_swin":
+        return TriModalSwinDETR(config, cfg=cfg)
+    if arch == "cssa_detr":
+        return MultiModalSwinDETR(config, cfg=cfg)
+    raise ValueError(f"Unknown model.arch: {arch!r} "
+                     "(expected 'tri_swin' or 'cssa_detr')")

@@ -34,9 +34,14 @@ def _move_batch(batch, device):
 
 
 def build_optimizer(model, cfg):
-    """AdamW with two param groups: backbones at backbone_lr, rest at lr."""
+    """AdamW with two param groups: backbones at backbone_lr, rest at lr.
+
+    Works for both architectures: cssa_detr params live under
+    `conv_encoder.{rgb_backbone,ir_backbone,depth_encoder}`, tri_swin params
+    under `tri_backbone.{rgb_backbone,ir_backbone,depth_encoder}` — the
+    substring matching below covers both.
+    """
     tcfg = cfg["train"]
-    enc = model.model.backbone.conv_encoder
     backbone_params, head_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:

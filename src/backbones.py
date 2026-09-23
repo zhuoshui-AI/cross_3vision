@@ -348,3 +348,190 @@ class DepthEncoder(nn.Module):
         m = depth_mask.float().unsqueeze(1)  # (B,1,H,W)
         m = nn.functional.adaptive_max_pool2d(m, target_hw)
         return m.squeeze(1).bool()  # (B, h, w)
+
+
+class SwinModalityBackbone(nn.Module):
+    """Unified Swin encoder for ONE modality (RGB / IR / Depth).
+
+    All three TMSC-Det branches use the same hierarchical Swin layout so their
+    per-stage feature maps share channel dims (96/192/384/768 for Swin-T/S)
+    and spatial strides (4/8/16/32) — cross-modal fusion then needs no
+    interpolation or channel juggling.
+
+    Input-channel adaptation (pretrained patch_embed.conv is 3-channel):
+      - in_chans=3 (RGB): keep as-is.
+      - in_chans=1 (IR):  sum the 3 conv-weight sets along the input-channel
+        axis (same trick proven on ResNet50 conv1).
+      - in_chans=2 (Depth): channel 0 = mean of the 3 pretrained sets fed with
+        normalized depth; channel 1 (validity mask) = zero weights, learned
+        during training. Bias is copied in all cases.
+
+    forward returns a list of 4 feature maps [C1..C4] at stride 4/8/16/32.
+    """
+
+    def __init__(self, variant="swin_tiny_patch4_window7_224", in_chans=3,
+                 pretrained=True, pretrained_path=None, pretrained_tag="ms_in22k",
+                 freeze_stages=2, img_size=512, drop_path_rate=0.0):
+        super().__init__()
+        import os
+        if in_chans not in (1, 2, 3):
+            raise ValueError(f"in_chans must be 1/2/3, got {in_chans}")
+        self.in_chans = in_chans
+        path_ok = bool(pretrained_path) and os.path.isfile(pretrained_path)
+        # Always construct the 3-channel model first so pretrained weights load
+        # cleanly; patch_embed is adapted to in_chans afterwards.
+        kwargs = {"pretrained": pretrained and not path_ok}
+        if pretrained_tag and kwargs.get("pretrained"):
+            kwargs["pretrained_cfg"] = pretrained_tag
+        kwargs["drop_path_rate"] = float(drop_path_rate)
+        try:
+            self.swin = timm.create_model(variant, img_size=img_size, **kwargs)
+        except TypeError:
+            kwargs.pop("pretrained_cfg", None)
+            kwargs.pop("drop_path_rate", None)
+            self.swin = timm.create_model(variant, **kwargs)
+        if path_ok:
+            import logging
+            state = torch.load(pretrained_path, map_location="cpu")
+            if "model" in state:
+                state = state["model"]
+            # Only remap Microsoft-origin checkpoints (downsample at end of
+            # stage: keys layers.0.downsample exist, layers.3.downsample
+            # don't). timm-saved state_dicts are already in timm layout.
+            has_msft = any(k.startswith("layers.0.downsample.")
+                           for k in state)
+            has_timm = any(k.startswith("layers.3.downsample.")
+                           for k in state)
+            if has_msft and not has_timm:
+                state = convert_msft_swin_to_timm(state)
+            # Drop the classification head — ImageNet-22k checkpoints have
+            # 21841 classes but timm builds 1000 by default. We never use
+            # the head anyway (we read per-stage maps before swin.norm).
+            state = {k: v for k, v in state.items()
+                     if not k.startswith("head.")}
+            self.swin.load_state_dict(state, strict=False)
+            logging.getLogger(__name__).info(
+                "%s: loaded local Swin checkpoint %s", variant, pretrained_path)
+
+        self._adapt_patch_embed(in_chans)
+        if hasattr(self.swin, "patch_embed"):
+            self.swin.patch_embed.strict_img_size = False
+
+        self.embed_dim = int(self.swin.embed_dim)
+        self.out_channels = [self.embed_dim * (2 ** i) for i in range(4)]
+        self.freeze_stages = int(freeze_stages)
+        # Final LayerNorm + classification head are never used (we read out
+        # per-stage maps before swin.norm); freeze so they don't waste
+        # optimizer slots or pollute checkpoints.
+        for name in ("norm", "head"):
+            mod = getattr(self.swin, name, None)
+            if mod is not None:
+                for p in mod.parameters():
+                    p.requires_grad_(False)
+        self._freeze_stages()
+
+    def _adapt_patch_embed(self, in_chans):
+        """Replace patch_embed.conv with an in_chans-input conv, reusing weights."""
+        old = self.swin.patch_embed.proj
+        if in_chans == 3:
+            return
+        new = nn.Conv2d(
+            in_chans, old.out_channels, kernel_size=old.kernel_size,
+            stride=old.stride, padding=old.padding, bias=old.bias is not None)
+        with torch.no_grad():
+            if in_chans == 1:
+                new.weight.copy_(old.weight.sum(dim=1, keepdim=True))
+            else:  # 2 channels: depth (mean of RGB sets) + zeroed mask channel
+                new.weight[:, 0:1].copy_(old.weight.mean(dim=1, keepdim=True))
+                nn.init.zeros_(new.weight[:, 1:2])
+            if old.bias is not None:
+                new.bias.copy_(old.bias)
+        self.swin.patch_embed.proj = new
+
+    def _freeze_stages(self):
+        if self.freeze_stages >= 1:
+            for p in self.swin.patch_embed.parameters():
+                p.requires_grad = False
+            if hasattr(self.swin, "pos_drop"):
+                for p in self.swin.pos_drop.parameters():
+                    p.requires_grad = False
+            if hasattr(self.swin, "norm_pre"):
+                for p in self.swin.norm_pre.parameters():
+                    p.requires_grad = False
+        for i, layer in enumerate(self.swin.layers):
+            if i < self.freeze_stages:
+                for p in layer.parameters():
+                    p.requires_grad = False
+
+    def train(self, mode=True):
+        """Keep frozen stages in eval() (see SwinRGBBackbone for rationale)."""
+        super().train(mode)
+        if mode and self.freeze_stages >= 1:
+            self.swin.patch_embed.eval()
+            if hasattr(self.swin, "pos_drop"):
+                self.swin.pos_drop.eval()
+            if hasattr(self.swin, "norm_pre"):
+                self.swin.norm_pre.eval()
+            for i, layer in enumerate(self.swin.layers):
+                if i < self.freeze_stages:
+                    layer.eval()
+        return self
+
+    # timm >=1.0 keeps Swin features in NHWC map layout; older timm (<1.0)
+    # uses flattened (B, H*W, C) tokens. We expose a uniform NHWC API so the
+    # fusion code never has to care which timm is installed.
+    def _nhwc_layout(self):
+        return getattr(self.swin, "output_fmt", "NLC") == "NHWC"
+
+    def stem_maps(self, x):
+        """patch_embed + pos_drop → (B, H/4, W/4, C) NHWC map."""
+        B, _, H, W = x.shape
+        feats = self.swin.patch_embed(x)
+        if hasattr(self.swin, "pos_drop"):
+            feats = self.swin.pos_drop(feats)
+        if hasattr(self.swin, "norm_pre"):
+            feats = self.swin.norm_pre(feats)
+        if self._nhwc_layout():
+            return feats
+        # Old timm: flatten tokens (B, L, C) → NHWC.
+        return feats.transpose(1, 2).reshape(
+            B, self.embed_dim, H // 4, W // 4).permute(0, 2, 3, 1).contiguous()
+
+    def run_stage(self, i, x_map):
+        """Run stage i on an NHWC map, return its NHWC output map.
+
+        PatchMerging sits at the START of layers[1..3], so stage 0 keeps the
+        stem resolution and stage i outputs H / (4 * 2^i).
+        """
+        if self._nhwc_layout():
+            return self.swin.layers[i](x_map)
+        B, H, W, C = x_map.shape
+        toks = x_map.reshape(B, H * W, C)
+        toks = self.swin.layers[i](toks)
+        _, L, C2 = toks.shape
+        if i == 0:
+            h2, w2 = H, W
+        else:
+            # PatchMerging pads odd input rows/cols before halving.
+            h2, w2 = (H + 1) // 2, (W + 1) // 2
+        return toks.transpose(1, 2).reshape(B, C2, h2, w2).permute(
+            0, 2, 3, 1).contiguous()
+
+    @staticmethod
+    def nhwc_to_nchw(x_map):
+        """(B, H, W, C) → (B, C, H, W)."""
+        return x_map.permute(0, 3, 1, 2).contiguous()
+
+    @staticmethod
+    def nchw_to_nhwc(fmap):
+        """(B, C, H, W) → (B, H, W, C)."""
+        return fmap.permute(0, 2, 3, 1).contiguous()
+
+    def forward(self, x):
+        """x: (B, in_chans, H, W). Returns [C1..C4] NCHW maps at stride 4..32."""
+        feats = self.stem_maps(x)
+        outs = []
+        for i in range(len(self.swin.layers)):
+            feats = self.run_stage(i, feats)
+            outs.append(self.nhwc_to_nchw(feats))
+        return outs
