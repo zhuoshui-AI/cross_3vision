@@ -623,11 +623,14 @@ def build_detr_config(cfg):
     )
     # DETR loss weights (defaults already match spec: ce=1, bbox=5, giou=2,
     # eos=0.1) but we surface them so the config is the single source of truth.
+    # Write through __dict__: bleeding-edge huggingface_hub versions install
+    # strict dataclass setattr validation that rejects float for fields
+    # annotated int (bbox/giou coefficients are declared int there).
     loss = cfg.get("loss", {})
     if "loss_bbox" in loss:
-        config.bbox_loss_coefficient = float(loss["loss_bbox"])
+        config.__dict__["bbox_loss_coefficient"] = float(loss["loss_bbox"])
     if "loss_giou" in loss:
-        config.giou_loss_coefficient = float(loss["loss_giou"])
+        config.__dict__["giou_loss_coefficient"] = float(loss["loss_giou"])
     # class_cost / bbox_cost / giou_cost keep DETR defaults (1/5/2).
     return config
 
