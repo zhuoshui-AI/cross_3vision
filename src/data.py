@@ -106,7 +106,8 @@ class MultiModalDataset(Dataset):
     """
 
     def __init__(self, data_root, split_file=None, ids=None,
-                 img_size=512, train=True, num_classes=12):
+                 img_size=512, train=True, num_classes=12,
+                 scan_source="labels"):
         self.data_root = data_root
         self.img_size = img_size
         self.train = train
@@ -123,18 +124,30 @@ class MultiModalDataset(Dataset):
             with open(split_file, "r") as fh:
                 self.ids = [ln.strip() for ln in fh if ln.strip()]
         else:
-            # Scan labels/ for stems, then keep only those where all 3
-            # modality files actually exist. Stray depth-only slices
-            # (e.g. "000002_080_00000048") have no labels and are dropped
-            # automatically; samples with a label but a missing modality
-            # are also dropped here to avoid FileNotFoundError in __getitem__.
+            # Scan for stems. scan_source="labels" (default, training):
+            # enumerate labels/*.txt — every training sample must be labeled.
+            # scan_source="images" (inference on unlabeled test sets):
+            # enumerate visible/ image files; per-sample label txts are
+            # optional (load_label returns empty for missing files).
             import logging
             logger = logging.getLogger(__name__)
-            candidates = sorted(
-                os.path.splitext(f)[0]
-                for f in os.listdir(self.label_dir)
-                if f.endswith(".txt")
-            )
+            if scan_source == "images":
+                candidates = sorted(
+                    os.path.splitext(f)[0]
+                    for f in os.listdir(self.rgb_dir)
+                    if f.lower().endswith(IMG_EXTS)
+                )
+            else:
+                if not os.path.isdir(self.label_dir):
+                    raise FileNotFoundError(
+                        f"labels dir not found: {self.label_dir} — training "
+                        "needs labels; for unlabeled test sets construct "
+                        "MultiModalDataset(scan_source='images')")
+                candidates = sorted(
+                    os.path.splitext(f)[0]
+                    for f in os.listdir(self.label_dir)
+                    if f.endswith(".txt")
+                )
             kept, dropped = [], []
             for stem in candidates:
                 ok = True

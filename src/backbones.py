@@ -450,8 +450,13 @@ class SwinModalityBackbone(nn.Module):
 
     def _freeze_stages(self):
         if self.freeze_stages >= 1:
-            for p in self.swin.patch_embed.parameters():
-                p.requires_grad = False
+            # Keep the ADAPTED patch_embed trainable for 1ch/2ch inputs: its
+            # weights were re-derived (sum/mean) from the 3ch pretrained conv,
+            # and the depth mask channel starts at zero — both need gradients
+            # to adapt. Only the stock 3ch stem is frozen.
+            if self.in_chans == 3:
+                for p in self.swin.patch_embed.parameters():
+                    p.requires_grad = False
             if hasattr(self.swin, "pos_drop"):
                 for p in self.swin.pos_drop.parameters():
                     p.requires_grad = False
@@ -467,7 +472,8 @@ class SwinModalityBackbone(nn.Module):
         """Keep frozen stages in eval() (see SwinRGBBackbone for rationale)."""
         super().train(mode)
         if mode and self.freeze_stages >= 1:
-            self.swin.patch_embed.eval()
+            if self.in_chans == 3:  # adapted (1ch/2ch) stems stay trainable
+                self.swin.patch_embed.eval()
             if hasattr(self.swin, "pos_drop"):
                 self.swin.pos_drop.eval()
             if hasattr(self.swin, "norm_pre"):

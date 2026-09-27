@@ -17,13 +17,18 @@ from .losses import cxcywh_to_xyxy_pixel
 
 
 @torch.no_grad()
-def evaluate(model, val_loader, device, cfg, amp_enabled=False):
-    """Returns dict with mAP@50-95 and per-class AP if torchmetrics present."""
+def evaluate(model, val_loader, device, cfg, amp_enabled=False, conf_th=0.0):
+    """Returns dict with mAP@50-95 and per-class AP if torchmetrics present.
+
+    conf_th defaults to 0.0 = keep ALL queries: pre-filtering low-score
+    predictions drops true positives and systematically under-reports mAP
+    (DETR convention is to feed every query to the metric). Thresholding
+    belongs to submission-time output (inference.py), not evaluation.
+    """
     if not _HAS_TM:
         return {"map_5095": float("nan"), "note": "torchmetrics unavailable"}
     model.eval()
     num_labels = int(cfg["model"]["num_labels"])
-    conf_th = float(cfg["inference"]["conf_threshold"])
     metric = MeanAveragePrecision(
         box_format="xyxy", iou_type="bbox",
         iou_thresholds=[round(v, 2) for v in

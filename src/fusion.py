@@ -225,7 +225,7 @@ class JointWindowCrossAttention(nn.Module):
         x: (M, B, C, H, W)
         key_valid: optional list of M (B, H, W) bool, True = valid token
         dropped_modality: optional int, this modality's keys are fully masked
-        returns: (M, B, C, H, W)
+        returns: residual delta (M, B, C, H, W); the caller adds it to x
         """
         M, B, C, H, W = x.shape
         ws, h, dh = self.ws, self.h, self.dh
@@ -286,7 +286,10 @@ class JointWindowCrossAttention(nn.Module):
         out = _merge_windows(out, ws, Hp, Wp)             # (M*B,Hp,Wp,C)
         out = out.view(M, B, Hp, Wp, C)[:, :, :H, :W, :]  # crop padding
         out = out.permute(0, 1, 4, 2, 3).contiguous()     # (M,B,C,H,W)
-        return x + out
+        # Return the DELTA only: HCMAFBlock owns the single residual
+        # (z = x + delta). Adding one here too would double the input
+        # (z = 2x + delta) at every fused stage.
+        return out
 
 
 class HCMAFBlock(nn.Module):
@@ -337,7 +340,7 @@ class HCMAFBlock(nn.Module):
             dropped = int(torch.randint(0, self.M, (1,), device=x.device).item())
 
         attn_out = self.attn(x, key_valid=key_valid, dropped_modality=dropped)
-        z = x + attn_out                              # (M,B,C,H,W)
+        z = x + attn_out  # single residual: attn returns the delta only
 
         z_maps = []
         for m in range(self.M):
