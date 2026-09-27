@@ -68,15 +68,20 @@ class EMA:
 
     def __init__(self, model, decay=0.9997):
         self.decay = decay
+        self.updates = 0
         self.shadow = {n: p.detach().clone()
                        for n, p in model.named_parameters() if p.requires_grad}
 
     @torch.no_grad()
     def update(self, model):
+        self.updates += 1
+        # Ramp the effective decay up from ~0 (timm-style warmup) so early
+        # EMA evals track the training weights instead of the random init.
+        d = min(self.decay, (1 + self.updates) / (10 + self.updates))
         for n, p in model.named_parameters():
             if not p.requires_grad:
                 continue
-            self.shadow[n].mul_(self.decay).add_(p.detach(), alpha=1 - self.decay)
+            self.shadow[n].mul_(d).add_(p.detach(), alpha=1 - d)
 
     def apply_to(self, model):
         """Return a state-dict copy with EMA weights swapped in (for eval)."""

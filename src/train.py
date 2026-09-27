@@ -34,9 +34,14 @@ def _move_batch(batch, device):
 
 
 def build_optimizer(model, cfg):
-    """AdamW with two param groups: backbones at backbone_lr, rest at lr."""
+    """AdamW with two param groups: backbones at backbone_lr, rest at lr.
+
+    Works for both architectures: cssa_detr params live under
+    `conv_encoder.{rgb_backbone,ir_backbone,depth_encoder}`, tri_swin params
+    under `tri_backbone.{rgb_backbone,ir_backbone,depth_encoder}` — the
+    substring matching below covers both.
+    """
     tcfg = cfg["train"]
-    enc = model.model.backbone.conv_encoder
     backbone_params, head_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
@@ -64,7 +69,8 @@ def build_scheduler(optimizer, cfg, total_steps):
         if step < warmup:
             return (step + 1) / max(1, warmup)  # linear warmup
         s = step - warmup
-        return 0.5 * (1 + math.cos(math.pi * s / cosine_steps))  # cosine
+        # cosine; clamp ≥0 so overshooting total_steps can't go negative
+        return max(0.0, 0.5 * (1 + math.cos(math.pi * s / cosine_steps)))
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -155,7 +161,8 @@ def train(cfg, resume=None):
 
     model = build_model(cfg).to(device)
     optimizer = build_optimizer(model, cfg)
-    steps_per_epoch = max(1, len(train_loader) // int(tcfg["grad_accum"]))
+    # ceil: the epoch-end flush below steps on leftover partial groups too
+    steps_per_epoch = max(1, math.ceil(len(train_loader) / int(tcfg["grad_accum"])))
     total_steps = steps_per_epoch * int(tcfg["epochs"])
     scheduler = build_scheduler(optimizer, cfg, total_steps)
 
@@ -188,14 +195,19 @@ def train(cfg, resume=None):
         model.train()
         running = 0.0
         optimizer.zero_grad()
+        accum = int(tcfg["grad_accum"])
+        n_batches = len(train_loader)
         for it, batch in enumerate(train_loader):
             batch = _move_batch(batch, device)
             with torch.autocast(device_type=device.split(":")[0],
                                 dtype=amp_dtype, enabled=amp):
                 out = model(**batch)
-                loss = out.loss / int(tcfg["grad_accum"])
+                loss = out.loss / accum
             scaler.scale(loss).backward()
-            if (it + 1) % int(tcfg["grad_accum"]) == 0:
+            # Step on full groups OR at the epoch's last batch, so a
+            # trailing partial group's gradients aren't silently dropped
+            # by the next epoch's optimizer.zero_grad().
+            if (it + 1) % accum == 0 or (it + 1) == n_batches:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
                 scaler.step(optimizer)
@@ -204,23 +216,31 @@ def train(cfg, resume=None):
                 scheduler.step()
                 if ema:
                     ema.update(model)
-            running += loss.item() * int(tcfg["grad_accum"])
+            running += loss.item() * accum
             if it % 50 == 0:
                 log.info(f"ep{epoch} it{it}/{len(train_loader)} "
-                         f"loss={loss.item()*int(tcfg['grad_accum']):.4f} "
+                         f"loss={loss.item()*accum:.4f} "
                          f"lr={scheduler.get_last_lr()[0]:.2e}")
         log.info(f"Epoch {epoch} mean loss = {running/len(train_loader):.4f}")
 
         if (epoch + 1) % val_interval == 0 or epoch + 1 == int(tcfg["epochs"]):
+            # Evaluate (and save best) with EMA weights when EMA is on: the
+            # shadow params are what we'd ship, so the metric and best.pth
+            # must reflect them. Raw weights resume training afterwards;
+            # last.pth always stores the raw training weights.
+            ema_backup = ema.apply_to(model) if ema else None
             metrics = evaluate(model, val_loader, device, cfg)
             score = metrics.get("map_5095", float("nan"))
             log.info(f"Val ep{epoch}: mAP@50-95={score:.4f} "
-                     f"mAP@50={metrics.get('map_50', float('nan')):.4f}")
+                     f"mAP@50={metrics.get('map_50', float('nan')):.4f}"
+                     + (" (EMA)" if ema else ""))
             if score == score and score > best:  # not NaN & improved
                 best = score
                 save_ckpt(os.path.join(ckpt_dir, "best.pth"),
                           model, optimizer, scheduler, epoch, best, cfg)
                 log.info(f"  ↑ new best {best:.4f} → best.pth")
+            if ema is not None:
+                ema.restore(model, ema_backup)
         save_ckpt(os.path.join(ckpt_dir, "last.pth"),
                   model, optimizer, scheduler, epoch, best, cfg)
 
