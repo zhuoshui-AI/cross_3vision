@@ -175,7 +175,13 @@ class MultiModalSwinDETR(DetrForObjectDetection):
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         with torch.no_grad():
-            self.class_labels_classifier.bias.fill_(bias_value)
+            # RetinaNet-style foreground prior: push ONLY the foreground
+            # classes low so queries start as "no object" (p_eos ≈ 0.89).
+            # Filling the whole bias vector (incl. EOS) makes the softmax
+            # uniform (p_eos = 1/13): every query starts as "object",
+            # which churns the Hungarian matching and blows up CE grads.
+            self.class_labels_classifier.bias[:-1].fill_(bias_value)
+            self.class_labels_classifier.bias[-1].fill_(0.0)
 
     # ------------------------------------------------------------------ forward
     def forward(
@@ -462,7 +468,13 @@ class TriModalSwinDETR(DetrForObjectDetection):
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         with torch.no_grad():
-            self.class_labels_classifier.bias.fill_(bias_value)
+            # RetinaNet-style foreground prior: push ONLY the foreground
+            # classes low so queries start as "no object" (p_eos ≈ 0.89).
+            # Filling the whole bias vector (incl. EOS) makes the softmax
+            # uniform (p_eos = 1/13): every query starts as "object",
+            # which churns the Hungarian matching and blows up CE grads.
+            self.class_labels_classifier.bias[:-1].fill_(bias_value)
+            self.class_labels_classifier.bias[-1].fill_(0.0)
 
     def forward(
         self,

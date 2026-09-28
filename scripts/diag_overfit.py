@@ -177,6 +177,24 @@ def main():
         out = model(**batch)
         opt.zero_grad()
         out.loss.backward()
+        # Every 250 steps: WHERE does the gradient come from? Groups are
+        # named by the first two module components; helps localize a
+        # gradient bomb (e.g. matcher churn in the class head).
+        if step % 250 == 0 or step == args.steps - 1:
+            groups = {}
+            for n, p in model.named_parameters():
+                if p.grad is not None:
+                    k = ".".join(n.split(".")[:2])
+                    groups[k] = groups.get(k, 0.0) + float(p.grad.norm()) ** 2
+            top_g = sorted(groups.items(), key=lambda kv: -kv[1])[:6]
+            top_p = sorted(
+                ((float(p.grad.norm()), n) for n, p in
+                 model.named_parameters() if p.grad is not None),
+                reverse=True)[:3]
+            print("         grad-by-module: "
+                  + ", ".join(f"{k}={v ** 0.5:.1f}" for k, v in top_g)
+                  + " | top: "
+                  + ", ".join(f"{n}={g:.1f}" for g, n in top_p), flush=True)
         grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 0.1)
         opt.step(); sched.step()
 
@@ -205,12 +223,23 @@ def main():
     # differently by mode (BatchNorm/Dropout/DropPath). Hook the fused
     # backbone feature to see whether collapse starts in the backbone.
     captured = {}
+    arch = cfg["model"].get("arch", "cssa_detr")
 
-    def _hook(module, inp, outp):
-        # MultiModalBackbone returns [(f_enh, mask)]
-        captured["f"] = outp[0][0].detach()
+    if arch == "tri_swin":
+        # tri_swin: conv_encoder is a never-called nn.Identity(); hook the
+        # actual fusion backbone. Its forward returns
+        # (pyramids, fpn_masks, strides); capture the last pyramid level.
+        def _hook(module, inp, outp):
+            pyramids = outp[0]
+            captured["f"] = pyramids[-1].detach()  # (B, C, h, w)
 
-    handle = model.model.backbone.conv_encoder.register_forward_hook(_hook)
+        handle = model.tri_backbone.register_forward_hook(_hook)
+    else:
+        def _hook(module, inp, outp):
+            # MultiModalBackbone returns [(f_enh, mask)]
+            captured["f"] = outp[0][0].detach()
+
+        handle = model.model.backbone.conv_encoder.register_forward_hook(_hook)
 
     def _mode_stats(mode):
         model.train(mode)
