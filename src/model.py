@@ -25,6 +25,8 @@ name `MultiModalSwinDETR` matches none of the keys, so we explicitly set
 """
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -33,7 +35,8 @@ from transformers import DetrConfig, DetrForObjectDetection
 from transformers.models.detr.modeling_detr import DetrObjectDetectionOutput
 
 from .backbones import (
-    SwinRGBBackbone, IRBackbone, DepthEncoder, SwinModalityBackbone)
+    SwinRGBBackbone, IRBackbone, DepthEncoder, SwinModalityBackbone,
+    RGBIRResNetBackbone)
 from .fusion import CSSAFusion, DepthLateFusion, HCMAFBlock, SimpleFPN
 
 
@@ -103,6 +106,9 @@ class MultiModalBackbone(nn.Module):
         )
 
         self.d_model = d_model
+        # Compat attr (class default is a placeholder); reflect the real
+        # output channel count of the fused feature map.
+        self.intermediate_channel_sizes = [d_model]
 
     def forward(self, pixel_values, pixel_mask):
         rgb = pixel_values["rgb"]
@@ -171,7 +177,6 @@ class MultiModalSwinDETR(DetrForObjectDetection):
         # the Hungarian matcher sees dense false positives, and training
         # oscillates (ce bounces 0.5<->1.2, giou never converges). pi=0.01
         # matches the original paper; we keep it class-agnostic.
-        import math
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         with torch.no_grad():
@@ -314,6 +319,266 @@ class MultiModalSwinDETR(DetrForObjectDetection):
                 p.requires_grad = True
 
 
+class RGBIRFusionBackbone(nn.Module):
+    """RGB+IR 早期拼接 + 深度交叉注意力融合主干（rgbir_resnet 架构）。
+
+    替换 DetrModel.backbone 中的 DetrConvEncoder，forward 返回
+    [(feature_map, mask)]，与 DetrConvEncoder 的返回契约一致，
+    因此位置编码等下游逻辑完全复用 HuggingFace 原实现。
+
+    处理流程：
+      1) RGB(3ch) 与 IR(1ch) 通道拼接 → 4ch，送入 RGBIRResNetBackbone
+         （ImageNet 预训练 ResNet50，conv1 适配 4 通道）→ stride-32 特征；
+      2) 深度图(1ch) + 有效掩码(1ch) → DepthEncoder 轻量 CNN → stride-32 特征；
+      3) 交叉注意力注入深度信息：Q = RGB+IR 融合特征，K=V = 深度特征，
+         深度无效像素经 key_padding_mask 屏蔽，避免空洞污染注意力。
+
+    pixel_values 为 dict（非 tensor）：
+        rgb        (B, 3, H, W) ImageNet 归一化
+        ir         (B, 1, H, W) [0,1]
+        depth      (B, 1, H, W) [0,1]（20000mm 映射，无效处置 0）
+        depth_mask (B, H, W)    bool，True 表示深度有效
+    """
+
+    intermediate_channel_sizes = [256]  # DetrModel.__init__ 会访问的兼容属性
+
+    def __init__(self, cfg):
+        super().__init__()
+        mcfg = cfg["model"]
+        d_model = int(mcfg["d_model"])
+
+        # ---- 1) RGB+IR 四通道联合 ResNet50 主干 ----
+        # 子模块命名为 rgbir_backbone，train.py 依据该名称把它归入
+        # backbone 参数组（使用更小的 backbone_lr 微调）。
+        self.rgbir_backbone = RGBIRResNetBackbone(
+            out_dim=d_model,
+            pretrained_path=mcfg.get("resnet_pretrained_path") or None,
+            freeze_stages=int(mcfg.get("resnet_freeze_stages", 1)),
+        )
+
+        # ---- 2) 深度分支：轻量 CNN（2ch = 深度 + 有效掩码），无预训练 ----
+        # 深度是几何信号，与图像语义差异大，从头训练更稳。
+        self.depth_encoder = DepthEncoder(out_dim=d_model)
+
+        # ---- 3) 交叉注意力融合：深度信息注入 RGB+IR 特征流 ----
+        self.depth_fuse = DepthLateFusion(
+            d_model=d_model,
+            num_heads=int(mcfg.get("depth_fuse_heads", 8)),
+            dropout=float(mcfg.get("depth_fuse_dropout", 0.0)),
+        )
+
+        self.d_model = d_model
+
+    def forward(self, pixel_values, pixel_mask):
+        rgb = pixel_values["rgb"]
+        ir = pixel_values["ir"]
+        depth = pixel_values["depth"]
+        depth_mask = pixel_values["depth_mask"]
+
+        # 通道拼接：(B,3,H,W) + (B,1,H,W) → (B,4,H,W)
+        x4 = torch.cat([rgb, ir], dim=1)
+        # 四通道联合 ResNet50 → (B, d_model, H/32, W/32)
+        f_rgbir = self.rgbir_backbone(x4)
+        # 深度分支 → (B, d_model, H/32, W/32)
+        f_depth = self.depth_encoder(depth, depth_mask)
+        # 深度有效掩码下采样到特征图尺寸（窗口内任一像素有效 → 该 token 有效）
+        depth_mask_ds = DepthEncoder.downsample_mask(
+            depth_mask, f_rgbir.shape[-2:])
+        # 交叉注意力：Q=RGB+IR 特征，K=V=深度特征 → (B, d_model, h, w)
+        f_enh = self.depth_fuse(f_rgbir, f_depth, depth_mask_ds)
+
+        # pixel_mask 下采样到特征图尺寸（与 DetrConvEncoder 行为一致）
+        if pixel_mask is None:
+            mask_ds = torch.ones(
+                (f_enh.shape[0], f_enh.shape[2], f_enh.shape[3]),
+                dtype=torch.bool, device=f_enh.device)
+        else:
+            mask_ds = F.interpolate(
+                pixel_mask[None].float(), size=f_enh.shape[-2:]
+            ).to(torch.bool)[0]
+        return [(f_enh, mask_ds)]
+
+
+class RGBIRResNetDETR(DetrForObjectDetection):
+    """RGB+IR 通道拼接 ResNet50 + 深度交叉注意力 + DETR 检测头。
+
+    架构（rgbir_resnet）：
+      RGB(3) ─┐ 通道拼接
+      IR(1)  ─┴→ 4ch ResNet50(ImageNet) ──┐
+                                         ├─ 交叉注意力(Q=RGBIR, KV=Depth) → DETR
+      Depth(1)+mask(1) → 轻量 CNN ────────┘
+
+    继承 HuggingFace DetrForObjectDetection：匈牙利匹配、CE/L1/GIoU
+    损失、辅助损失、后处理全部复用；仅替换 conv_encoder 并改写 forward
+    以支持多模态 batch dict（原版 forward 对 dict 做 pixel_values.shape
+    会崩溃）。forward 流程与 MultiModalSwinDETR 完全一致，仅骨干不同。
+    """
+
+    def __init__(self, config: DetrConfig, cfg=None):
+        super().__init__(config)
+        # 强制损失函数属性解析到 ForObjectDetectionLoss
+        # （类名不含 LOSS_MAPPING 任何键，属性会错误回退到 ForCausalLMLoss）
+        self.loss_type = "ForObjectDetection"
+
+        if cfg is None:
+            raise ValueError("RGBIRResNetDETR needs the run config `cfg`.")
+
+        # 我们的主干输出 d_model 通道（而非 resnet50 的 2048），
+        # 重建 1x1 input_projection 使通道数匹配。
+        d_model = config.d_model
+        self.model.input_projection = nn.Conv2d(d_model, d_model, kernel_size=1)
+        # 换掉 conv_encoder；DetrConvModel 的位置编码逻辑保持原样
+        self.model.backbone.conv_encoder = RGBIRFusionBackbone(cfg)
+        # 只初始化新建的 input_projection。
+        # 注意：这里绝不能调用 self.post_init()！super().__init__ 已初始化
+        # DETR 编码器/解码器/检测头，RGBIRFusionBackbone 内部也已加载
+        # 预训练 ResNet50 权重；再调一次 post_init() 会用 N(0,0.02) 递归
+        # 重置所有 Linear/Conv2d，摧毁预训练权重，导致 mAP 长期为 0。
+        self.model.input_projection.apply(self._init_weights)
+
+        # DETR 前景先验偏置初始化（Carion et al. ECCV 2020, §A.4）：
+        # 分类头偏置设为 -log((1-π)/π)，使模型初始以 ~π 概率预测"有物体"。
+        # 只压低前景类（12 类）偏置，EOS 类偏置保持 0 —— 若把全部 13 类
+        # 都压低，softmax 会变成均匀分布（p_eos=1/13），每个 query 都以
+        # "是物体"起步，匈牙利匹配剧烈震荡、CE 梯度爆炸。
+        import math
+        prior_prob = 0.01
+        bias_value = -math.log((1.0 - prior_prob) / prior_prob)
+        with torch.no_grad():
+            self.class_labels_classifier.bias[:-1].fill_(bias_value)
+            self.class_labels_classifier.bias[-1].fill_(0.0)
+
+    # ------------------------------------------------------------------ forward
+    def forward(
+        self,
+        pixel_values_rgb,
+        pixel_values_ir,
+        pixel_values_depth,
+        depth_mask,
+        pixel_mask=None,
+        labels=None,
+        output_attentions=None,
+        output_hidden_states=None,
+        return_dict=None,
+    ):
+        """手动驱动编码器/解码器管线（与 MultiModalSwinDETR 相同）。
+
+        参数与 collate_fn / inference 的产出一致：
+        pixel_values_* 为 (B, C, H, W) 张量；depth_mask/pixel_mask 为
+        (B, H, W) bool。损失、检测头全部继承自 HF。
+        """
+        output_attentions = (output_attentions if output_attentions is not None
+                             else self.config.output_attentions)
+        output_hidden_states = (output_hidden_states if output_hidden_states is not None
+                                else self.config.output_hidden_states)
+        return_dict = (return_dict if return_dict is not None
+                       else self.config.use_return_dict)
+
+        device = pixel_values_rgb.device
+        batch_size = pixel_values_rgb.shape[0]
+        if pixel_mask is None:
+            pixel_mask = torch.ones(
+                (batch_size, pixel_values_rgb.shape[2], pixel_values_rgb.shape[3]),
+                dtype=torch.bool, device=device)
+
+        # 多模态输入打包成 dict 交给融合主干
+        pixel_values = {
+            "rgb": pixel_values_rgb,
+            "ir": pixel_values_ir,
+            "depth": pixel_values_depth,
+            "depth_mask": depth_mask,
+        }
+
+        # 主干：返回 (features_list, pos_list)，每项为 (feature_map, mask)
+        features, object_queries_list = self.model.backbone(
+            pixel_values, pixel_mask)
+        feature_map, mask = features[-1]
+        if mask is None:
+            raise ValueError("Backbone did not return a downsampled pixel mask")
+
+        # 1x1 通道投影 → 展平为 (B, HW, d_model)
+        projected = self.model.input_projection(feature_map)
+        flattened = projected.flatten(2).permute(0, 2, 1)
+        object_queries = object_queries_list[-1].flatten(2).permute(0, 2, 1)
+        flattened_mask = mask.flatten(1)
+
+        encoder_outputs = self.model.encoder(
+            inputs_embeds=flattened,
+            attention_mask=flattened_mask,
+            object_queries=object_queries,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        query_pos = self.model.query_position_embeddings.weight.unsqueeze(0).repeat(
+            batch_size, 1, 1)
+        queries = torch.zeros_like(query_pos)
+        decoder_outputs = self.model.decoder(
+            inputs_embeds=queries,
+            attention_mask=None,
+            object_queries=object_queries,
+            query_position_embeddings=query_pos,
+            encoder_hidden_states=encoder_outputs[0],
+            encoder_attention_mask=flattened_mask,
+            output_attentions=output_attentions,
+            output_hidden_states=output_hidden_states,
+            return_dict=return_dict,
+        )
+
+        sequence_output = decoder_outputs[0]
+        logits = self.class_labels_classifier(sequence_output)
+        pred_boxes = self.bbox_predictor(sequence_output).sigmoid()
+
+        loss, loss_dict, auxiliary_outputs = None, None, None
+        if labels is not None:
+            outputs_class, outputs_coord = None, None
+            if self.config.auxiliary_loss:
+                intermediate = (decoder_outputs.intermediate_hidden_states
+                                if return_dict else decoder_outputs[4])
+                outputs_class = self.class_labels_classifier(intermediate)
+                outputs_coord = self.bbox_predictor(intermediate).sigmoid()
+            loss, loss_dict, auxiliary_outputs = self.loss_function(
+                logits, labels, device, pred_boxes, self.config,
+                outputs_class, outputs_coord)
+
+        if not return_dict:
+            if auxiliary_outputs is not None:
+                output = (logits, pred_boxes) + auxiliary_outputs + decoder_outputs + encoder_outputs
+            else:
+                output = (logits, pred_boxes) + decoder_outputs + encoder_outputs
+            return ((loss, loss_dict) + output) if loss is not None else output
+
+        return DetrObjectDetectionOutput(
+            loss=loss,
+            loss_dict=loss_dict,
+            logits=logits,
+            pred_boxes=pred_boxes,
+            auxiliary_outputs=auxiliary_outputs,
+            last_hidden_state=decoder_outputs.last_hidden_state,
+            decoder_hidden_states=decoder_outputs.hidden_states,
+            decoder_attentions=decoder_outputs.attentions,
+            cross_attentions=decoder_outputs.cross_attentions,
+            encoder_last_hidden_state=encoder_outputs.last_hidden_state,
+            encoder_hidden_states=encoder_outputs.hidden_states,
+            encoder_attentions=encoder_outputs.attentions,
+        )
+
+    # ----------------------------------------------------------- backbone freeze
+    def freeze_backbone(self):
+        """冻结主干（4 通道 ResNet + 深度编码器），融合模块与检测头保持可训练。"""
+        enc = self.model.backbone.conv_encoder
+        for sub in (enc.rgbir_backbone, enc.depth_encoder):
+            for p in sub.parameters():
+                p.requires_grad = False
+
+    def unfreeze_backbone(self):
+        enc = self.model.backbone.conv_encoder
+        for sub in (enc.rgbir_backbone, enc.depth_encoder):
+            for p in sub.parameters():
+                p.requires_grad = True
+
+
 class TriModalSwinFusion(nn.Module):
     """Three per-modality Swin towers + per-scale HCMAF + FPN.
 
@@ -407,7 +672,9 @@ class TriModalSwinFusion(nn.Module):
             maps = [bb.run_stage(i, m)
                     for bb, m in zip(self._branches, maps)]
             if i in self.fuse_stage_idx:
-                h, w = H // (4 * 2 ** i), W // (4 * 2 ** i)
+                # Use the ACTUAL map shape: Swin stages pad odd/window-misaligned
+                # dims, so H // (4 * 2 ** i) can differ from the real resolution.
+                _, h, w, _ = maps[0].shape
                 nchw_maps = [SwinModalityBackbone.nhwc_to_nchw(m)
                              for m in maps]
                 vis = self._pixel_mask_down(pixel_mask, (h, w))
@@ -464,7 +731,6 @@ class TriModalSwinDETR(DetrForObjectDetection):
         self.model.input_projection = nn.Identity()
         # No post_init(): see MultiModalSwinDETR for why a second init would
         # destroy pretrained backbone weights.
-        import math
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         with torch.no_grad():
@@ -651,9 +917,11 @@ def build_model(cfg):
     """Factory: DetrConfig → detection model, selected by model.arch."""
     config = build_detr_config(cfg)
     arch = cfg["model"].get("arch", "cssa_detr")
+    if arch == "rgbir_resnet":
+        return RGBIRResNetDETR(config, cfg=cfg)
     if arch == "tri_swin":
         return TriModalSwinDETR(config, cfg=cfg)
     if arch == "cssa_detr":
         return MultiModalSwinDETR(config, cfg=cfg)
     raise ValueError(f"Unknown model.arch: {arch!r} "
-                     "(expected 'tri_swin' or 'cssa_detr')")
+                     "(expected 'rgbir_resnet', 'tri_swin' or 'cssa_detr')")

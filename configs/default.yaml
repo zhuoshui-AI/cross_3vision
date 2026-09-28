@@ -13,8 +13,16 @@ data:
 
 # ---- Model ----
 model:
-  # 架构开关：tri_swin = TMSC-Det（三 Swin + HCMAF + FPN）；cssa_detr = 旧结构
-  arch: "tri_swin"
+  # 架构开关：rgbir_resnet = RGB+IR 4通道拼接 ResNet50 + 深度交叉注意力（本分支默认）；
+  #          tri_swin = TMSC-Det（三 Swin + HCMAF + FPN）；cssa_detr = 旧结构
+  arch: "rgbir_resnet"
+
+  # ---- rgbir_resnet 配置 ----
+  resnet_variant: "resnet50_imagenet_4ch"        # 4 通道适配版 ResNet50
+  resnet_pretrained_path: "./weights/resnet50-11ad3fa6.pth"  # 本地 ImageNet 权重
+  resnet_freeze_stages: 1                        # 冻结 layer1（适配后的 conv1 保持可训练）
+  depth_fuse_heads: 8                            # 深度交叉注意力头数
+  depth_fuse_dropout: 0.0                        # 0 = train/eval 前向完全一致（小数据集更稳）
 
   # ---- TMSC-Det (tri_swin) Lite 配置：三路全部 Swin-T ----
   tri_rgb_variant: "swin_tiny_patch4_window7_224"

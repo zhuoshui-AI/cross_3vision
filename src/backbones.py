@@ -268,6 +268,115 @@ class IRBackbone(nn.Module):
         return self.adapter(f)
 
 
+class RGBIRResNetBackbone(nn.Module):
+    """RGB+IR 四通道联合 ResNet50 主干（rgbir_resnet 架构）。
+
+    核心思路：
+      - RGB(3ch) 与 IR(1ch) 在输入端直接通道拼接成 4 通道，
+        由同一支 ResNet50 联合提取特征 —— 早期融合让两种模态
+        在浅层卷积阶段即可互补交互（IR 提供热目标，RGB 提供纹理细节）。
+      - conv1 从预训练 3 通道权重适配到 4 通道：
+          * 前 3 通道：原样保留 ImageNet 预训练的 RGB 权重；
+          * 第 4 通道（IR）：取 3 组 RGB 权重的均值 —— IR 是灰度
+            热图，均值滤波等于"对三个颜色滤波器响应求平均"，
+            保持输出量级与 RGB 通道一致。
+      - BatchNorm 全部替换为 GroupNorm（与 IRBackbone 相同技巧）：
+        小 batch 下 BN 的 train/eval 统计切换会导致训练与验证
+        行为不一致，GroupNorm 无运行统计量、两种模式完全一致。
+        预训练权重的 γ/β 仿射参数键名与 BN 相同，可直接复制，
+        running_mean/var 丢弃不用。
+
+    输出：(B, out_dim, H/32, W/32) 的 stride-32 特征图，
+    经 1x1 卷积 + GroupNorm 适配到 DETR 的 d_model 维度。
+    """
+
+    def __init__(self, out_dim=256, variant="resnet50_imagenet_4ch",
+                 pretrained_path=None, freeze_stages=1):
+        super().__init__()
+        import os
+        self.variant = variant
+        self.out_dim = out_dim
+        self.freeze_stages = int(freeze_stages)
+
+        # 1) 构建 GroupNorm 版 ResNet50（不加载在线权重，norm_layer 替换 BN）
+        rn = torchvision.models.resnet50(weights=None, norm_layer=_group_norm)
+
+        # 2) 加载本地 ImageNet 预训练权重（仅仿射参数 γ/β 能对上，
+        #    running_mean/var 为多余键，strict=False 自动忽略）
+        path_ok = bool(pretrained_path) and os.path.isfile(pretrained_path)
+        if path_ok:
+            state = torch.load(pretrained_path, map_location="cpu")
+            rn.load_state_dict(state, strict=False)
+        else:
+            import logging
+            logging.getLogger(__name__).warning(
+                "RGBIRResNetBackbone: 预训练权重 '%s' 不存在，将使用随机初始化。"
+                "请先运行 scripts/download_pretrained.sh 下载到 weights/ 目录。",
+                pretrained_path)
+
+        # 3) conv1 适配 3ch → 4ch（前 3 通道保留 RGB 权重，第 4 通道取均值）
+        old_w = rn.conv1.weight.detach()          # (64, 3, 7, 7)
+        rn.conv1 = nn.Conv2d(4, 64, kernel_size=7, stride=2,
+                             padding=3, bias=False)
+        with torch.no_grad():
+            rn.conv1.weight[:, :3].copy_(old_w)                     # RGB 通道
+            rn.conv1.weight[:, 3:4].copy_(old_w.mean(dim=1, keepdim=True))  # IR 通道
+
+        # 4) 只保留特征提取所需部分（stem + layer1~4，丢弃分类头 fc）
+        self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
+        self.layer1 = rn.layer1
+        self.layer2 = rn.layer2
+        self.layer3 = rn.layer3
+        self.layer4 = rn.layer4
+        self.in_channels = 2048
+
+        # 5) 通道适配器：2048 → d_model（1x1 卷积 + GroupNorm）
+        self.adapter = nn.Sequential(
+            nn.Conv2d(self.in_channels, out_dim, 1, bias=False),
+            nn.GroupNorm(8, out_dim),
+        )
+
+        # 6) 阶段冻结：前 freeze_stages 个 stage 冻结以稳定微调；
+        #    适配后的 conv1 保持可训练（其权重是重派生的，需要梯度继续适应 IR 模态）
+        if self.freeze_stages >= 1:
+            for p in self.layer1.parameters():
+                p.requires_grad = False
+        if self.freeze_stages >= 2:
+            for p in self.layer2.parameters():
+                p.requires_grad = False
+        if self.freeze_stages >= 3:
+            for p in self.layer3.parameters():
+                p.requires_grad = False
+
+    def train(self, mode=True):
+        """冻结的 stage 始终保持 eval 模式。
+
+        model.train() 会把所有子模块切到训练模式，若不固定，
+        冻结层内的随机行为（如有）会在训练/验证间产生分布差异。
+        """
+        super().train(mode)
+        if mode:
+            if self.freeze_stages >= 1:
+                self.layer1.eval()
+            if self.freeze_stages >= 2:
+                self.layer2.eval()
+            if self.freeze_stages >= 3:
+                self.layer3.eval()
+        return self
+
+    def forward(self, x):
+        """x: (B, 4, H, W)，前 3 通道为 ImageNet 归一化的 RGB，第 4 通道为 [0,1] IR。
+
+        返回 (B, out_dim, H/32, W/32)。
+        """
+        f = self.stem(x)
+        f = self.layer1(f)
+        f = self.layer2(f)
+        f = self.layer3(f)
+        f = self.layer4(f)          # (B, 2048, H/32, W/32)
+        return self.adapter(f)      # (B, out_dim, H/32, W/32)
+
+
 class _AnyThermalAdapter(nn.Module):
     """Thin wrapper around AnyThermal ViT-B/14 (placeholder for swap-in later).
 

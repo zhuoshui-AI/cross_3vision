@@ -48,8 +48,11 @@ def build_optimizer(model, cfg):
             continue
         # Anything under our MultiModalBackbone's rgb/ir/depth sub-backbones
         # gets the backbone learning rate; fusion + DETR heads get the head lr.
+        # rgbir_resnet 架构的 4 通道 ResNet 主干命名为 rgbir_backbone，同样归入
+        # backbone 参数组（微调 lr）。
         is_backbone = any(s in n for s in (
-            "rgb_backbone.", "ir_backbone.", "depth_encoder."))
+            "rgb_backbone.", "ir_backbone.", "depth_encoder.",
+            "rgbir_backbone."))
         (backbone_params if is_backbone else head_params).append(p)
     groups = [
         {"params": head_params, "lr": float(tcfg["lr"])},
