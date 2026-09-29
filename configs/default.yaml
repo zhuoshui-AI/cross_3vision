@@ -28,8 +28,9 @@ model:
   # vanilla DETR 从零训练需 ~3500 万张图，本数据集 150 epoch 只有 27 万张。
   # facebook/detr-resnet-50 的 encoder/decoder/bbox_predictor 与我们维度完全一致，
   # 直接继承 COCO 定位先验，把"从零学检测"变成"微调"。
-  # 置空（null）则禁用；离线服务器可改为本地目录路径 weights/detr-resnet-50-coco
-  detr_warm_start: "facebook/detr-resnet-50"
+  # 权重已通过 git-lfs 随仓库分发（weights/detr-resnet-50-coco/），离线可用；
+  # 置空（null）则禁用热启动
+  detr_warm_start: "./weights/detr-resnet-50-coco"
 
   # ---- TMSC-Det (tri_swin) Lite 配置：三路全部 Swin-T ----
   tri_rgb_variant: "swin_tiny_patch4_window7_224"
