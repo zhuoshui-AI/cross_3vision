@@ -913,12 +913,80 @@ def build_detr_config(cfg):
     return config
 
 
+def warm_start_detr_head(model, source="facebook/detr-resnet-50"):
+    """从 COCO 预训练的 DETR 检查点热启动检测头（小数据集关键 recipe）。
+
+    背景：vanilla DETR 从零训练需要 ~3500 万张图（COCO 300 epoch）才能收敛；
+    本数据集仅 1800 张 × 150 epoch = 27 万张，差 130 倍。实验证据链
+    （scripts/diag_rgbir_overfit.py）显示管线机制无 bug：8 图过拟合健康，
+    但真实数据全量训练 150 epoch 后 mAP@50 仍 ≈ 0.001（query 塌缩阶段
+    无法在真实数据上及时逃逸）。
+
+    解法：facebook/detr-resnet-50 的检测头维度与我们完全一致
+    （d_model=256、encoder/decoder 6+6 层、100 queries），直接加载其
+    COCO 学到的定位/注意力先验：
+      - model.encoder.*           编码器（含注意力、FFN）
+      - model.decoder.*           解码器
+      - model.query_position_embeddings  100 个 query 的位置嵌入
+      - bbox_predictor.*          回归头（与类别无关，COCO 先验直接可用）
+    自动跳过形状不匹配的参数：
+      - class_labels_classifier   COCO 91+1 类 vs 我们 12+1 类 → 保留随机+前景先验初始化
+      - backbone / input_projection 我们的多模态骨干完全不同 → 保留各自初始化
+
+    source 可以是 HuggingFace hub 名（首次运行自动下载并缓存到服务器），
+    也可以是本地目录（含 config.json + model.safetensors，
+    可用 save_pretrained 预先保存，离线机器用）。
+    """
+    import logging
+    log = logging.getLogger(__name__)
+    try:
+        ref = DetrForObjectDetection.from_pretrained(source)
+    except Exception as e:  # 网络不可达等 → 明确报错而不是静默跳过
+        raise RuntimeError(
+            f"加载 COCO 预训练 DETR 头失败（source={source!r}）：{e}。"
+            "离线服务器请先在有网机器执行："
+            "python -c \"from transformers import DetrForObjectDetection as D; "
+            "D.from_pretrained('facebook/detr-resnet-50')"
+            ".save_pretrained('weights/detr-resnet-50-coco')\" "
+            "并把整个目录拷到服务器，配置改为该路径。") from e
+    ref_state = ref.state_dict()
+    own_state = model.state_dict()
+    # 显式排除 input_projection：COCO 的投影作用于 resnet50 的 2048 维特征，
+    # 我们的是 256→256，即使 bias 形状碰巧相同也不应拷贝
+    ref_state = {k: v for k, v in ref_state.items()
+                 if not k.startswith("model.input_projection")}
+    n_loaded, n_skip = 0, []
+    with torch.no_grad():
+        for k, v in ref_state.items():
+            if k in own_state and own_state[k].shape == v.shape:
+                own_state[k].copy_(v)
+                n_loaded += 1
+            else:
+                n_skip.append(k)
+    del ref
+    head_groups = {}
+    for k in ref_state:
+        if k in own_state and own_state[k].shape == ref_state[k].shape:
+            top = ".".join(k.split(".")[:2])
+            head_groups[top] = head_groups.get(top, 0) + 1
+    log.info("DETR 头热启动：加载 %d 个张量（%s），跳过 %d 个（backbone/分类头等，"
+             "形状不匹配属预期）", n_loaded,
+             {g: c for g, c in sorted(head_groups.items())}, len(n_skip))
+    # bbox_predictor 已从 COCO 加载（定位先验），但分类头仍是我们的
+    # 前景先验初始化 —— __init__ 已处理，无需重复。
+
+
 def build_model(cfg):
     """Factory: DetrConfig → detection model, selected by model.arch."""
     config = build_detr_config(cfg)
     arch = cfg["model"].get("arch", "cssa_detr")
     if arch == "rgbir_resnet":
-        return RGBIRResNetDETR(config, cfg=cfg)
+        model = RGBIRResNetDETR(config, cfg=cfg)
+        # COCO 预训练热启动检测头（小数据集 recipe；detr_warm_start 置空禁用）
+        warm = cfg["model"].get("detr_warm_start")
+        if warm:
+            warm_start_detr_head(model, warm)
+        return model
     if arch == "tri_swin":
         return TriModalSwinDETR(config, cfg=cfg)
     if arch == "cssa_detr":

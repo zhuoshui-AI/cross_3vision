@@ -153,7 +153,11 @@ def run_group(mode, cfg, batch, labels, tgt, device, args):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--data-root", required=True)
+    # 注意：不要照抄示例里的 /path/to/... 占位符！
+    # 不传 --data-root 时自动读 config 的 data.train_split（绝对目录）。
+    ap.add_argument("--data-root", default=None,
+                    help="训练数据目录（含 visible/infrared/depth/labels）；"
+                         "缺省读 config 里的 data.train_split")
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--n-imgs", type=int, default=8)
     ap.add_argument("--steps", type=int, default=1000)
@@ -165,9 +169,19 @@ def main():
     args = ap.parse_args()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[diag] device={device}  data={args.data_root}", flush=True)
     cfg = load_yaml_config(args.config)
     cfg["data"]["img_size"] = args.img_size
+    # 诊断只测「从零管线」：禁用 COCO 热启动，保持四组对照可比
+    cfg["model"]["detr_warm_start"] = None
+
+    if args.data_root is None:
+        sp = cfg["data"].get("train_split") or cfg["data"].get("data_root")
+        if sp and os.path.isabs(sp) and os.path.isdir(sp):
+            args.data_root = sp
+            print(f"[diag] --data-root 未指定，使用 config train_split: {sp}")
+        else:
+            ap.error("无法从 config 推断数据目录，请显式传 --data-root")
+    print(f"[diag] device={device}  data={args.data_root}", flush=True)
 
     ds = MultiModalDataset(data_root=args.data_root, split_file=None,
                            img_size=args.img_size, train=False,

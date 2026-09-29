@@ -25,3 +25,5 @@ outputs/
 Thumbs.db
 .DS_Store
 example_data/
+# COCO 热启动权重目录（166MB，不入库；服务器用 hub 自动下载或手动拷贝）
+weights/detr-resnet-50-coco/

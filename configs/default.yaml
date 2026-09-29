@@ -24,6 +24,13 @@ model:
   depth_fuse_heads: 8                            # 深度交叉注意力头数
   depth_fuse_dropout: 0.0                        # 0 = train/eval 前向完全一致（小数据集更稳）
 
+  # COCO 预训练 DETR 头热启动（小数据集关键 recipe）：
+  # vanilla DETR 从零训练需 ~3500 万张图，本数据集 150 epoch 只有 27 万张。
+  # facebook/detr-resnet-50 的 encoder/decoder/bbox_predictor 与我们维度完全一致，
+  # 直接继承 COCO 定位先验，把"从零学检测"变成"微调"。
+  # 置空（null）则禁用；离线服务器可改为本地目录路径 weights/detr-resnet-50-coco
+  detr_warm_start: "facebook/detr-resnet-50"
+
   # ---- TMSC-Det (tri_swin) Lite 配置：三路全部 Swin-T ----
   tri_rgb_variant: "swin_tiny_patch4_window7_224"
   tri_ir_variant: "swin_tiny_patch4_window7_224"
