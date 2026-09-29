@@ -938,17 +938,37 @@ def warm_start_detr_head(model, source="facebook/detr-resnet-50"):
     可用 save_pretrained 预先保存，离线机器用）。
     """
     import logging
+    import os
     log = logging.getLogger(__name__)
     try:
         ref = DetrForObjectDetection.from_pretrained(source)
-    except Exception as e:  # 网络不可达等 → 明确报错而不是静默跳过
-        raise RuntimeError(
-            f"加载 COCO 预训练 DETR 头失败（source={source!r}）：{e}。"
-            "离线服务器请先在有网机器执行："
-            "python -c \"from transformers import DetrForObjectDetection as D; "
-            "D.from_pretrained('facebook/detr-resnet-50')"
-            ".save_pretrained('weights/detr-resnet-50-coco')\" "
-            "并把整个目录拷到服务器，配置改为该路径。") from e
+    except Exception as first_err:
+        # huggingface.co 在国内服务器经常不可达：自动切 HF 国内镜像重试一次
+        if os.environ.get("HF_ENDPOINT") != "https://hf-mirror.com" \
+                and "huggingface.co" in str(first_err):
+            log.warning("直连 huggingface.co 失败，改用国内镜像 hf-mirror.com 重试：%s",
+                        first_err)
+            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
+            try:
+                ref = DetrForObjectDetection.from_pretrained(source)
+            except Exception as e:
+                raise RuntimeError(
+                    f"镜像 hf-mirror.com 也加载失败（source={source!r}）：{e}。"
+                    "请在本地有网机器执行："
+                    "python -c \"from transformers import DetrForObjectDetection as D; "
+                    "D.from_pretrained('facebook/detr-resnet-50')"
+                    ".save_pretrained('weights/detr-resnet-50-coco')\" "
+                    "然后把整个 weights/detr-resnet-50-coco 目录 scp 到服务器，"
+                    "并把 config 的 detr_warm_start 改为 './weights/detr-resnet-50-coco'。"
+                ) from e
+        else:
+            raise RuntimeError(
+                f"加载 COCO 预训练 DETR 头失败（source={source!r}）：{first_err}。"
+                "离线服务器请先在有网机器执行："
+                "python -c \"from transformers import DetrForObjectDetection as D; "
+                "D.from_pretrained('facebook/detr-resnet-50')"
+                ".save_pretrained('weights/detr-resnet-50-coco')\" "
+                "并把整个目录拷到服务器，配置改为该路径。") from first_err
     ref_state = ref.state_dict()
     own_state = model.state_dict()
     # 显式排除 input_projection：COCO 的投影作用于 resnet50 的 2048 维特征，
