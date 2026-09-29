@@ -99,6 +99,16 @@ class DepthLateFusion(nn.Module):
     Q = fused RGB+IR features; K=V = depth features. depth_mask (True=valid)
     is inverted to key_padding_mask (True=ignore) for nn.MultiheadAttention.
     Placed between the multi-modal backbone output and the DETR encoder.
+
+    零初始化（关键修复）：nn.MultiheadAttention 默认初始化尺度过大
+    （Xavier 输出投影 ~O(1)），加上默认 init 的 FFN，会在主干特征与
+    DETR 之间插入一个大尺度变换，导致 decoder 的 100 个 query 输出完全
+    相同（query 塌缩，qstd≈0），匈牙利匹配无法区分 query，训练停滞在
+    loss≈22 平台（对照实验：原生 HF DETR 在 200 步内 loss 66→17.8、
+    query 多样性 0.11；带默认初始化的融合模块 500 步仍卡在 28+）。
+    将 out_proj 与 FFN 末层置零后，模块在训练起点是严格恒等映射
+    f_enh = fused（与「旁路深度融合」等价），深度信息随后被渐进注入，
+    对称性可像原生 DETR 一样正常打破。HCMAF 采用的是同一套技巧。
     """
 
     def __init__(self, d_model=256, num_heads=8, dropout=0.0, ffn_mult=4):
@@ -116,6 +126,13 @@ class DepthLateFusion(nn.Module):
             nn.Linear(d_model * ffn_mult, d_model),
             nn.Dropout(dropout),
         )
+        # ---- 零初始化：模块起点 = 恒等映射 ----
+        # 1) 注意力输出投影置零 → attn_out 恒为 0
+        nn.init.zeros_(self.cross_attn.out_proj.weight)
+        nn.init.zeros_(self.cross_attn.out_proj.bias)
+        # 2) FFN 末层置零 → FFN 残差分支起点为 0
+        nn.init.zeros_(self.ffn[-2].weight)
+        nn.init.zeros_(self.ffn[-2].bias)
 
     def forward(self, fused, depth_feat, depth_mask=None):
         """
@@ -125,11 +142,12 @@ class DepthLateFusion(nn.Module):
         returns:     (B, C, h, w)
         """
         B, C, h, w = fused.shape
-        q = fused.flatten(2).transpose(1, 2)              # (B, hw, C)
-        kv = depth_feat.flatten(2).transpose(1, 2)       # (B, hw, C)
-
-        q = self.norm_q(q)
-        kv = self.norm_kv(kv)
+        # 残差主干使用【原始】token（不先做 LN）——标准 pre-norm 结构：
+        # out = x + attn(LN(x))，零初始化下严格等于 x（恒等起点）。
+        # 旧写法 out = LN(x) + attn(LN(x)) 会在起点就把特征双重 LayerNorm，
+        # 破坏主干输出的尺度结构，等于在 DETR 前插了一个大变换。
+        q_raw = fused.flatten(2).transpose(1, 2)            # (B, hw, C)
+        kv = self.norm_kv(depth_feat.flatten(2).transpose(1, 2))  # (B, hw, C)
 
         key_padding_mask = None
         if depth_mask is not None:
@@ -144,11 +162,11 @@ class DepthLateFusion(nn.Module):
                 idx = (h * w) // 2
                 key_padding_mask[all_invalid, idx] = False
 
-        attn_out, _ = self.cross_attn(q, kv, kv, key_padding_mask=key_padding_mask,
+        attn_out, _ = self.cross_attn(self.norm_q(q_raw), kv, kv,
+                                      key_padding_mask=key_padding_mask,
                                       need_weights=False)
-        out = q + attn_out
-        out = self.norm_out(out)
-        out = out + self.ffn(out)
+        out = q_raw + attn_out          # 零初始化下 = q_raw
+        out = out + self.ffn(self.norm_out(out))  # 零初始化下 = out
 
         return out.transpose(1, 2).reshape(B, C, h, w).contiguous()
 
