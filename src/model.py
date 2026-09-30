@@ -913,6 +913,34 @@ def build_detr_config(cfg):
     return config
 
 
+def _load_reference_state(source):
+    """加载 COCO 参考检查点的 state_dict，完全不联网、不构建参考模型。
+
+    关键：绝不能用 from_pretrained 加载本地目录——构建 DetrForObjectDetection
+    会顺带创建 timm resnet50 骨干并去 huggingface.co 下载 timm 权重，
+    离线服务器直接崩溃（我们只要头权重，骨干根本用不到）。
+    - 本地目录：safetensors / pytorch_model.bin 直接读张量；
+    - hub 名：from_pretrained（需联网，走缓存或 HF_ENDPOINT 镜像）。
+    """
+    import os
+    if os.path.isdir(source):
+        st = os.path.join(source, "model.safetensors")
+        if os.path.isfile(st):
+            from safetensors.torch import load_file
+            return load_file(st)
+        pt = os.path.join(source, "pytorch_model.bin")
+        if os.path.isfile(pt):
+            return torch.load(pt, map_location="cpu")
+        raise RuntimeError(
+            f"目录 {source!r} 中没有 model.safetensors / pytorch_model.bin")
+    # hub 名（如 facebook/detr-resnet-50）：需要网络，构建模型即可
+    # （此时有网，timm 骨干下载不受影响）
+    ref = DetrForObjectDetection.from_pretrained(source)
+    state = ref.state_dict()
+    del ref
+    return state
+
+
 def warm_start_detr_head(model, source="facebook/detr-resnet-50"):
     """从 COCO 预训练的 DETR 检查点热启动检测头（小数据集关键 recipe）。
 
@@ -940,36 +968,8 @@ def warm_start_detr_head(model, source="facebook/detr-resnet-50"):
     import logging
     import os
     log = logging.getLogger(__name__)
-    try:
-        ref = DetrForObjectDetection.from_pretrained(source)
-    except Exception as first_err:
-        # huggingface.co 在国内服务器经常不可达：自动切 HF 国内镜像重试一次
-        if os.environ.get("HF_ENDPOINT") != "https://hf-mirror.com" \
-                and "huggingface.co" in str(first_err):
-            log.warning("直连 huggingface.co 失败，改用国内镜像 hf-mirror.com 重试：%s",
-                        first_err)
-            os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
-            try:
-                ref = DetrForObjectDetection.from_pretrained(source)
-            except Exception as e:
-                raise RuntimeError(
-                    f"镜像 hf-mirror.com 也加载失败（source={source!r}）：{e}。"
-                    "请在本地有网机器执行："
-                    "python -c \"from transformers import DetrForObjectDetection as D; "
-                    "D.from_pretrained('facebook/detr-resnet-50')"
-                    ".save_pretrained('weights/detr-resnet-50-coco')\" "
-                    "然后把整个 weights/detr-resnet-50-coco 目录 scp 到服务器，"
-                    "并把 config 的 detr_warm_start 改为 './weights/detr-resnet-50-coco'。"
-                ) from e
-        else:
-            raise RuntimeError(
-                f"加载 COCO 预训练 DETR 头失败（source={source!r}）：{first_err}。"
-                "离线服务器请先在有网机器执行："
-                "python -c \"from transformers import DetrForObjectDetection as D; "
-                "D.from_pretrained('facebook/detr-resnet-50')"
-                ".save_pretrained('weights/detr-resnet-50-coco')\" "
-                "并把整个目录拷到服务器，配置改为该路径。") from first_err
-    ref_state = ref.state_dict()
+
+    ref_state = _load_reference_state(source)
     own_state = model.state_dict()
     # 显式排除 input_projection：COCO 的投影作用于 resnet50 的 2048 维特征，
     # 我们的是 256→256，即使 bias 形状碰巧相同也不应拷贝
@@ -983,7 +983,6 @@ def warm_start_detr_head(model, source="facebook/detr-resnet-50"):
                 n_loaded += 1
             else:
                 n_skip.append(k)
-    del ref
     head_groups = {}
     for k in ref_state:
         if k in own_state and own_state[k].shape == ref_state[k].shape:
