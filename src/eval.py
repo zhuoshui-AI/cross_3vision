@@ -69,9 +69,30 @@ def evaluate(model, val_loader, device, cfg, amp_enabled=False, conf_th=0.0):
         metric.update(preds, targets)
 
     res = metric.compute()
+
+    def _f(key):
+        # 数据集目标过小（无 medium/large 框）时 torchmetrics 返回 -1 或缺失，
+        # DETR log.txt 约定用总指标填充这些槽位。
+        try:
+            v = float(res[key].item())
+        except (KeyError, AttributeError):
+            v = -1.0
+        return v
+
+    map_all, mar_all = _f("map"), _f("mar_100")
     return {
-        "map_5095": float(res["map"].item()),
-        "map_50": float(res["map_50"].item()),
-        "mar_100": float(res["mar_100"].item()),
+        "map_5095": map_all,
+        "map_50": _f("map_50"),
+        "map_75": _f("map_75"),
+        # 无 s/m/l 分层时退化为总指标，保持 test_coco_eval_bbox 12 项齐全
+        "map_small": _f("map_small") if _f("map_small") >= 0 else map_all,
+        "map_medium": _f("map_medium") if _f("map_medium") >= 0 else map_all,
+        "map_large": _f("map_large") if _f("map_large") >= 0 else map_all,
+        "mar_1": _f("mar_1"),
+        "mar_10": _f("mar_10"),
+        "mar_100": mar_all,
+        "mar_small": _f("mar_small") if _f("mar_small") >= 0 else mar_all,
+        "mar_medium": _f("mar_medium") if _f("mar_medium") >= 0 else mar_all,
+        "mar_large": _f("mar_large") if _f("mar_large") >= 0 else mar_all,
         "per_class_ap": res.get("map_per_class", None),
     }

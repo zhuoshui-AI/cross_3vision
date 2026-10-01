@@ -6,8 +6,10 @@ We bypass HF Trainer for explicit control over the multi-modal batch dict
 reused from HF via MultiModalSwinDETR.loss_function (ForObjectDetectionLoss).
 """
 import argparse
+import json
 import math
 import os
+import re
 
 import torch
 from torch.utils.data import DataLoader
@@ -78,7 +80,42 @@ def build_scheduler(optimizer, cfg, total_steps):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def train(cfg, resume=None):
+def _scale_loss_stats(raw_stats, loss_weights, prefix):
+    """按 DETR log.txt 约定把 loss_dict 均值展开成 缩放/未缩放 两版字段。
+
+    raw_stats: {loss_dict key: 均值}（HF 返回的均为未乘权重的原始值，
+    辅助层键形如 loss_ce_0）。输出键示例：
+    train_loss_ce / train_loss_ce_unscaled；
+    class_error / cardinality_error 不加权（与原仓一致）。
+    """
+    stats = {}
+    for k, v in raw_stats.items():
+        base = re.sub(r"_\d+$", "", k)  # 剥掉辅助层后缀 _0.._4
+        is_error = base in ("class_error", "cardinality_error")
+        scale = 1.0 if is_error else float(loss_weights.get(base, 1.0))
+        stats[f"{prefix}_{k}"] = v * scale
+        stats[f"{prefix}_{k}_unscaled"] = v
+    return stats
+
+
+@torch.no_grad()
+def _val_loss_pass(model, val_loader, device, cfg):
+    """在验证集上计算 DETR 损失分量的均值（no_grad，不改 BN/EMA 状态）。"""
+    was_training = model.training
+    model.eval()
+    sums, n = {}, 0
+    for batch in val_loader:
+        batch = _move_batch(batch, device)
+        out = model(**batch)
+        for k, v in out.loss_dict.items():
+            sums[k] = sums.get(k, 0.0) + float(v.item())
+        n += 1
+    if was_training:
+        model.train()
+    return {k: v / max(1, n) for k, v in sums.items()}
+
+
+def train(cfg, resume=None, restart=None):
     tcfg = cfg["train"]
     log = setup_logging(tcfg.get("log_dir"), "multimodal_swin_detr")
     set_seed(42)
@@ -178,7 +215,15 @@ def train(cfg, resume=None):
 
     start_epoch = 0
     best = -1.0
-    if resume and os.path.isfile(resume):
+    if restart and os.path.isfile(restart):
+        # 热重启（SGDR 式新余弦周期）：只继承模型权重，优化器/调度器全新。
+        # 调度器按当前 config 的 epochs 从 warmup + 峰值 lr 重新退火；
+        # EMA 状态未入 checkpoint，自动从载入权重重新累积。
+        state = torch.load(restart, map_location=device)
+        model.load_state_dict(state["model"], strict=False)
+        log.info(f"Restart: 载入 {restart} 权重，optimizer/scheduler 全新 "
+                 f"（新 cosine 周期 {tcfg['epochs']} epochs）")
+    elif resume and os.path.isfile(resume):
         state = torch.load(resume, map_location=device)
         model.load_state_dict(state["model"], strict=False)
         if state.get("optimizer"):
@@ -194,9 +239,19 @@ def train(cfg, resume=None):
     val_interval = int(tcfg["val_interval"])
     grad_clip = float(tcfg["grad_clip"])
 
+    # ---- DETR 风格 per-epoch JSONL 日志（对齐 facebook/detr 的 log.txt）----
+    log_dir = tcfg.get("log_dir") or "./outputs/logs"
+    os.makedirs(log_dir, exist_ok=True)
+    jsonl_path = os.path.join(log_dir, "log.txt")
+    loss_weights = {k: float(v) for k, v in cfg.get("loss", {}).items()}
+    n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    log.info(f"DETR-style epoch log → {jsonl_path} "
+             f"(trainable params: {n_parameters/1e6:.1f}M)")
+
     for epoch in range(start_epoch, int(tcfg["epochs"])):
         model.train()
         running = 0.0
+        train_sums, train_n = {}, 0   # 本 epoch 各损失分量的累计
         optimizer.zero_grad()
         accum = int(tcfg["grad_accum"])
         n_batches = len(train_loader)
@@ -220,30 +275,77 @@ def train(cfg, resume=None):
                 if ema:
                     ema.update(model)
             running += loss.item() * accum
+            with torch.no_grad():  # 损失分量累计（用于 epoch 末的 JSONL）
+                for k, v in out.loss_dict.items():
+                    train_sums[k] = train_sums.get(k, 0.0) + float(v.item())
+                train_n += 1
             if it % 50 == 0:
                 log.info(f"ep{epoch} it{it}/{len(train_loader)} "
                          f"loss={loss.item()*accum:.4f} "
                          f"lr={scheduler.get_last_lr()[0]:.2e}")
         log.info(f"Epoch {epoch} mean loss = {running/len(train_loader):.4f}")
 
-        if (epoch + 1) % val_interval == 0 or epoch + 1 == int(tcfg["epochs"]):
+        # ---- 组装本 epoch 的 JSONL 记录 ----
+        train_means = {k: v / max(1, train_n) for k, v in train_sums.items()}
+        stats = {"train_lr": float(scheduler.get_last_lr()[0])}
+        stats.update(_scale_loss_stats(train_means, loss_weights, "train"))
+        # 缩放后的总损失（与 HF 的 out.loss 同口径：sum(分量 × 权重)）
+        loss_keys = {"loss_ce", "loss_bbox", "loss_giou"}
+        stats["train_loss"] = sum(
+            v * (1.0 if re.sub(r"_\d+$", "", k)
+                 in ("class_error", "cardinality_error")
+                 else float(loss_weights.get(re.sub(r"_\d+$", "", k), 1.0)))
+            for k, v in train_means.items()
+            if re.sub(r"_\d+$", "", k) in loss_keys)
+
+        do_val = ((epoch + 1) % val_interval == 0
+                  or epoch + 1 == int(tcfg["epochs"]))
+
+        # 每个 epoch 都算 val 损失（EMA 权重，快速 no_grad 前向）；
+        # mAP 只在 val_interval 时算（慢）。
+        ema_backup = ema.apply_to(model) if ema else None
+        val_means = _val_loss_pass(model, val_loader, device, cfg)
+        stats.update(_scale_loss_stats(val_means, loss_weights, "test"))
+        stats["test_loss"] = sum(
+            v * float(loss_weights.get(re.sub(r"_\d+$", "", k), 1.0))
+            for k, v in val_means.items()
+            if re.sub(r"_\d+$", "", k) in loss_keys)
+
+        if do_val:
             # Evaluate (and save best) with EMA weights when EMA is on: the
             # shadow params are what we'd ship, so the metric and best.pth
             # must reflect them. Raw weights resume training afterwards;
             # last.pth always stores the raw training weights.
-            ema_backup = ema.apply_to(model) if ema else None
             metrics = evaluate(model, val_loader, device, cfg)
             score = metrics.get("map_5095", float("nan"))
             log.info(f"Val ep{epoch}: mAP@50-95={score:.4f} "
                      f"mAP@50={metrics.get('map_50', float('nan')):.4f}"
                      + (" (EMA)" if ema else ""))
+            # COCO 标准 12 项顺序；本数据集只有小目标，s/m/l 槽位重复填
+            # 全量值（对应原 DETR log 的 test_coco_eval_bbox 字段）
+            coco12 = [
+                metrics.get("map_5095"), metrics.get("map_50"),
+                metrics.get("map_75"), metrics.get("map_small"),
+                metrics.get("map_medium"), metrics.get("map_large"),
+                metrics.get("mar_1"), metrics.get("mar_10"),
+                metrics.get("mar_100"), metrics.get("mar_small"),
+                metrics.get("mar_medium"), metrics.get("mar_large"),
+            ]
+            stats["test_coco_eval_bbox"] = [
+                float(x) if x is not None else None for x in coco12]
             if score == score and score > best:  # not NaN & improved
                 best = score
                 save_ckpt(os.path.join(ckpt_dir, "best.pth"),
                           model, optimizer, scheduler, epoch, best, cfg)
                 log.info(f"  ↑ new best {best:.4f} → best.pth")
-            if ema is not None:
-                ema.restore(model, ema_backup)
+        if ema is not None:
+            ema.restore(model, ema_backup)
+
+        stats["epoch"] = epoch
+        stats["n_parameters"] = n_parameters
+        with open(jsonl_path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(stats) + "\n")
+
         save_ckpt(os.path.join(ckpt_dir, "last.pth"),
                   model, optimizer, scheduler, epoch, best, cfg)
 
@@ -254,12 +356,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/default.yaml")
     ap.add_argument("--data-root", default=None)
-    ap.add_argument("--resume", default=None)
+    ap.add_argument("--resume", default=None,
+                    help="断点续训：恢复权重+optimizer+scheduler+epoch")
+    ap.add_argument("--restart", default=None,
+                    help="热重启：只载入权重，新 cosine 周期从头退火")
     args = ap.parse_args()
     cfg = load_yaml_config(args.config)
     if args.data_root:
         cfg["data"]["data_root"] = args.data_root
-    train(cfg, resume=args.resume)
+    train(cfg, resume=args.resume, restart=args.restart)
 
 
 if __name__ == "__main__":
