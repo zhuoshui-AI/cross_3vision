@@ -173,12 +173,17 @@ class MultiModalDataset(Dataset):
         Photometric normalization is applied per-modality afterwards (RGB ImageNet,
         IR /255, Depth /20000 + mask). Mosaic/MixUp are intentionally disabled:
         they break the cross-modal spatial alignment the fusion relies on.
+
+        正则化（治过拟合，10-01 实验证据）：crop 下限 0.5→0.4 增强尺度扰动；
+        另在 __getitem__ 里对 RGB 单独做轻度亮度/对比度抖动 —— albumentations
+        的 additional_targets 会把光度变换同等地作用到 IR/depth 上，而热图
+        和深度是物理量，绝不能做光度增强，所以光度抖动必须手工只加给 RGB。
         """
         if train:
             transforms = [
                 _make_transform(
                     A.RandomResizedCrop, self.img_size,
-                    scale=(0.5, 1.0), ratio=(0.8, 1.2),
+                    scale=(0.4, 1.0), ratio=(0.8, 1.2),
                     interpolation=cv2.INTER_LINEAR, p=1.0,
                 ),
                 A.HorizontalFlip(p=0.5),
@@ -248,6 +253,9 @@ class MultiModalDataset(Dataset):
         rgb_t = data["image"]
         ir_t = data["ir"]
         depth_t = data["depth"]
+        # RGB-only 光度抖动（训练时）：IR 热图与深度是物理量，不做光度增强。
+        if self.train:
+            rgb_t = self._jitter_rgb(rgb_t)
         H2, W2 = rgb_t.shape[:2]
         # Albumentations may broadcast a single-channel "image" to 3 channels
         # depending on version/interpolation; force IR and depth back to a
@@ -294,6 +302,18 @@ class MultiModalDataset(Dataset):
             "image_id": torch.tensor(idx, dtype=torch.long),
             "stem": stem,
         }
+
+    @staticmethod
+    def _jitter_rgb(rgb_hwc):
+        """轻度亮度/对比度抖动，仅用于训练期 RGB（保持 uint8 输出）。
+
+        幅度刻意温和（对比度 ±10%、亮度 ±15/255）：目标是打掉像素级
+        记忆化（过拟合源头之一），不是模拟光照剧变。
+        """
+        contrast = 1.0 + float(np.random.uniform(-0.1, 0.1))
+        brightness = float(np.random.uniform(-15.0, 15.0))
+        x = (rgb_hwc.astype(np.float32) - 128.0) * contrast + 128.0 + brightness
+        return np.clip(x, 0.0, 255.0).astype(np.uint8)
 
     @staticmethod
     def _normalize_rgb(rgb_hwc):

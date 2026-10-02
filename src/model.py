@@ -328,10 +328,13 @@ class RGBIRFusionBackbone(nn.Module):
 
     处理流程：
       1) RGB(3ch) 与 IR(1ch) 通道拼接 → 4ch，送入 RGBIRResNetBackbone
-         （ImageNet 预训练 ResNet50，conv1 适配 4 通道）→ stride-32 特征；
-      2) 深度图(1ch) + 有效掩码(1ch) → DepthEncoder 轻量 CNN → stride-32 特征；
-      3) 交叉注意力注入深度信息：Q = RGB+IR 融合特征，K=V = 深度特征，
-         深度无效像素经 key_padding_mask 屏蔽，避免空洞污染注意力。
+         （ImageNet 预训练 ResNet50，conv1 适配 4 通道）→ 多尺度 C3/C4/C5；
+      2) SimpleFPN（top-down + PAN bottom-up）→ P3/P4/P5（stride 8/16/32，
+         d_model 通道）——极小目标（w≈0.02-0.09 归一化）在 stride-32 上
+         不足一个 cell，是漏检的结构性根源，必须让 encoder 直接看到 P3/P4；
+      3) 深度图(1ch) + 有效掩码(1ch) → DepthEncoder 轻量 CNN → stride-32 特征；
+         交叉注意力在 P5（最粗尺度，与 DepthEncoder 输出对齐）注入：
+         Q = P5，K=V = 深度特征，深度无效像素经 key_padding_mask 屏蔽。
 
     pixel_values 为 dict（非 tensor）：
         rgb        (B, 3, H, W) ImageNet 归一化
@@ -342,25 +345,31 @@ class RGBIRFusionBackbone(nn.Module):
 
     intermediate_channel_sizes = [256]  # DetrModel.__init__ 会访问的兼容属性
 
+    # FPN 输出层级：高分辨率 → 低分辨率（与返回列表顺序一致）
+    fpn_strides = [8, 16, 32]
+
     def __init__(self, cfg):
         super().__init__()
         mcfg = cfg["model"]
         d_model = int(mcfg["d_model"])
 
-        # ---- 1) RGB+IR 四通道联合 ResNet50 主干 ----
+        # ---- 1) RGB+IR 四通道联合 ResNet50 主干（输出 C3/C4/C5）----
         # 子模块命名为 rgbir_backbone，train.py 依据该名称把它归入
         # backbone 参数组（使用更小的 backbone_lr 微调）。
         self.rgbir_backbone = RGBIRResNetBackbone(
-            out_dim=d_model,
             pretrained_path=mcfg.get("resnet_pretrained_path") or None,
             freeze_stages=int(mcfg.get("resnet_freeze_stages", 1)),
         )
 
-        # ---- 2) 深度分支：轻量 CNN（2ch = 深度 + 有效掩码），无预训练 ----
+        # ---- 2) FPN：C3/C4/C5 → P3/P4/P5（全部 d_model 通道）----
+        # lateral 1x1 负责通道适配（ResNet 不再自带单尺度 adapter）。
+        self.fpn = SimpleFPN(self.rgbir_backbone.out_channels, d_model)
+
+        # ---- 3) 深度分支：轻量 CNN（2ch = 深度 + 有效掩码），无预训练 ----
         # 深度是几何信号，与图像语义差异大，从头训练更稳。
         self.depth_encoder = DepthEncoder(out_dim=d_model)
 
-        # ---- 3) 交叉注意力融合：深度信息注入 RGB+IR 特征流 ----
+        # ---- 4) 交叉注意力融合：深度信息注入 P5（stride-32）----
         self.depth_fuse = DepthLateFusion(
             d_model=d_model,
             num_heads=int(mcfg.get("depth_fuse_heads", 8)),
@@ -377,41 +386,50 @@ class RGBIRFusionBackbone(nn.Module):
 
         # 通道拼接：(B,3,H,W) + (B,1,H,W) → (B,4,H,W)
         x4 = torch.cat([rgb, ir], dim=1)
-        # 四通道联合 ResNet50 → (B, d_model, H/32, W/32)
-        f_rgbir = self.rgbir_backbone(x4)
-        # 深度分支 → (B, d_model, H/32, W/32)
+        # 四通道联合 ResNet50 → C3/C4/C5，FPN → P3/P4/P5（高→低分辨率）
+        c3, c4, c5 = self.rgbir_backbone(x4)
+        p3, p4, p5 = self.fpn([c3, c4, c5])
+        # 深度分支 → (B, d_model, H/32, W/32)，在 P5 上做交叉注意力注入
         f_depth = self.depth_encoder(depth, depth_mask)
-        # 深度有效掩码下采样到特征图尺寸（窗口内任一像素有效 → 该 token 有效）
         depth_mask_ds = DepthEncoder.downsample_mask(
-            depth_mask, f_rgbir.shape[-2:])
-        # 交叉注意力：Q=RGB+IR 特征，K=V=深度特征 → (B, d_model, h, w)
-        f_enh = self.depth_fuse(f_rgbir, f_depth, depth_mask_ds)
+            depth_mask, p5.shape[-2:])
+        p5 = self.depth_fuse(p5, f_depth, depth_mask_ds)
 
-        # pixel_mask 下采样到特征图尺寸（与 DetrConvEncoder 行为一致）
-        if pixel_mask is None:
-            mask_ds = torch.ones(
-                (f_enh.shape[0], f_enh.shape[2], f_enh.shape[3]),
-                dtype=torch.bool, device=f_enh.device)
-        else:
-            mask_ds = F.interpolate(
-                pixel_mask[None].float(), size=f_enh.shape[-2:]
-            ).to(torch.bool)[0]
-        return [(f_enh, mask_ds)]
+        # pixel_mask 逐级下采样到各特征图尺寸（与 DetrConvEncoder 行为一致）
+        feats = [p3, p4, p5]
+        out = []
+        for f in feats:
+            if pixel_mask is None:
+                m = torch.ones((f.shape[0], f.shape[2], f.shape[3]),
+                               dtype=torch.bool, device=f.device)
+            else:
+                m = F.interpolate(
+                    pixel_mask[None].float(), size=f.shape[-2:]
+                ).to(torch.bool)[0]
+            out.append((f, m))
+        return out
 
 
 class RGBIRResNetDETR(DetrForObjectDetection):
-    """RGB+IR 通道拼接 ResNet50 + 深度交叉注意力 + DETR 检测头。
+    """RGB+IR 通道拼接 ResNet50 + FPN 多尺度 + 深度交叉注意力 + DETR 检测头。
 
     架构（rgbir_resnet）：
       RGB(3) ─┐ 通道拼接
-      IR(1)  ─┴→ 4ch ResNet50(ImageNet) ──┐
-                                         ├─ 交叉注意力(Q=RGBIR, KV=Depth) → DETR
-      Depth(1)+mask(1) → 轻量 CNN ────────┘
+      IR(1)  ─┴→ 4ch ResNet50(ImageNet) ─→ FPN → P3/P4/P5 ─┐
+                                                          ├→ DETR encoder
+      Depth(1)+mask(1) → 轻量 CNN ──交叉注意力注入 P5 ──────┘
+
+    P3/P4/P5（stride 8/16/32）各自展平为 token 拼接后送入 encoder
+    （每个尺度附加可学习的 scale embedding 以区分层级）。512 输入下
+    共 64²+32²+16² = 5376 token，注意力显存随平方增长；显存不足时
+    可在 config 用 rgbir_encoder_scales 砍掉 stride-8 层（如 [16, 32]），
+    P3 的细节仍会经 PAN bottom-up 通路汇入 P4/P5。
 
     继承 HuggingFace DetrForObjectDetection：匈牙利匹配、CE/L1/GIoU
     损失、辅助损失、后处理全部复用；仅替换 conv_encoder 并改写 forward
     以支持多模态 batch dict（原版 forward 对 dict 做 pixel_values.shape
-    会崩溃）。forward 流程与 MultiModalSwinDETR 完全一致，仅骨干不同。
+    会崩溃）。encoder/decoder 权重对 token 数量不敏感，COCO 热启动
+    （warm_start_detr_head）依旧可用。
     """
 
     def __init__(self, config: DetrConfig, cfg=None):
@@ -423,12 +441,24 @@ class RGBIRResNetDETR(DetrForObjectDetection):
         if cfg is None:
             raise ValueError("RGBIRResNetDETR needs the run config `cfg`.")
 
-        # 我们的主干输出 d_model 通道（而非 resnet50 的 2048），
-        # 重建 1x1 input_projection 使通道数匹配。
+        # 我们的主干经 FPN 后输出 d_model 通道（而非 resnet50 的 2048），
+        # 重建 1x1 input_projection 使通道数匹配（对每个尺度共享）。
         d_model = config.d_model
         self.model.input_projection = nn.Conv2d(d_model, d_model, kernel_size=1)
-        # 换掉 conv_encoder；DetrConvModel 的位置编码逻辑保持原样
-        self.model.backbone.conv_encoder = RGBIRFusionBackbone(cfg)
+        # 换掉 conv_encoder；DetrConvModel 会为返回的每个尺度自动算 sine 位置编码
+        conv_encoder = RGBIRFusionBackbone(cfg)
+        self.model.backbone.conv_encoder = conv_encoder
+        # 送入 encoder 的 FPN 层级（高分辨率 → 低分辨率），以及区分层级的
+        # 可学习尺度嵌入。默认全部三层。
+        self.encoder_strides = [int(s) for s in cfg["model"].get(
+            "rgbir_encoder_scales", [8, 16, 32])]
+        unknown = set(self.encoder_strides) - set(conv_encoder.fpn_strides)
+        if unknown:
+            raise ValueError(
+                f"rgbir_encoder_scales 含未知层级 {sorted(unknown)}；"
+                f"可选值: {conv_encoder.fpn_strides}")
+        self.scale_embed = nn.Embedding(len(self.encoder_strides), d_model)
+        nn.init.normal_(self.scale_embed.weight, std=0.02)
         # 只初始化新建的 input_projection。
         # 注意：这里绝不能调用 self.post_init()！super().__init__ 已初始化
         # DETR 编码器/解码器/检测头，RGBIRFusionBackbone 内部也已加载
@@ -489,18 +519,33 @@ class RGBIRResNetDETR(DetrForObjectDetection):
             "depth_mask": depth_mask,
         }
 
-        # 主干：返回 (features_list, pos_list)，每项为 (feature_map, mask)
+        # 主干 + FPN：返回 [(P3,m3),(P4,m4),(P5,m5)] 及每尺度的 sine 位置编码
         features, object_queries_list = self.model.backbone(
             pixel_values, pixel_mask)
-        feature_map, mask = features[-1]
-        if mask is None:
+        conv_encoder = self.model.backbone.conv_encoder
+        if any(m is None for _, m in features):
             raise ValueError("Backbone did not return a downsampled pixel mask")
 
-        # 1x1 通道投影 → 展平为 (B, HW, d_model)
-        projected = self.model.input_projection(feature_map)
-        flattened = projected.flatten(2).permute(0, 2, 1)
-        object_queries = object_queries_list[-1].flatten(2).permute(0, 2, 1)
-        flattened_mask = mask.flatten(1)
+        # 多尺度 token 组装：只取 encoder_strides 指定的层级，
+        # 每层 1x1 投影 → 展平 → 拼接；位置编码附加尺度嵌入后同样拼接。
+        embeds, attn_masks, poses = [], [], []
+        scale_idx = 0
+        for i, ((feature_map, mask), stride) in enumerate(
+                zip(features, conv_encoder.fpn_strides)):
+            if stride not in self.encoder_strides:
+                continue
+            projected = self.model.input_projection(feature_map)
+            embeds.append(projected.flatten(2).permute(0, 2, 1))
+            # 位置编码按原始层级索引取（跳层时 object_queries_list 不缩位），
+            # 尺度嵌入按选中序号取
+            pos = object_queries_list[i] \
+                + self.scale_embed.weight[scale_idx].view(1, -1, 1, 1)
+            poses.append(pos.flatten(2).permute(0, 2, 1))
+            attn_masks.append(mask.flatten(1))
+            scale_idx += 1
+        flattened = torch.cat(embeds, dim=1)
+        object_queries = torch.cat(poses, dim=1)
+        flattened_mask = torch.cat(attn_masks, dim=1)
 
         encoder_outputs = self.model.encoder(
             inputs_embeds=flattened,

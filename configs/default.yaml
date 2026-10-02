@@ -23,6 +23,13 @@ model:
   resnet_freeze_stages: 1                        # 冻结 layer1（适配后的 conv1 保持可训练）
   depth_fuse_heads: 8                            # 深度交叉注意力头数
   depth_fuse_dropout: 0.0                        # 0 = train/eval 前向完全一致（小数据集更稳）
+  # FPN（P3/P4/P5, stride 8/16/32）中送入 DETR encoder 的层级。
+  # 实验证据：单尺度 stride-32 时训练集 cardinality error 长期 ≈4.5 压不下去
+  # ——极小目标在 stride-32 上不足一个 cell，是漏检的结构性根源。
+  # 三层全开（512 输入 ≈ 4096+1024+256 = 5376 token，注意力显存随平方增长，
+  # 显存不足就减 batch_size 加 grad_accum）；砍成 [16, 32] 时 P3 细节仍会
+  # 经 PAN bottom-up 通路汇入 P4/P5。
+  rgbir_encoder_scales: [8, 16, 32]
 
   # COCO 预训练 DETR 头热启动（小数据集关键 recipe）：
   # vanilla DETR 从零训练需 ~3500 万张图，本数据集 150 epoch 只有 27 万张。
@@ -72,8 +79,11 @@ model:
   encoder_layers: 6
   decoder_layers: 6
   auxiliary_loss: true
-  detr_dropout: 0.0                  # 0 = 关闭 DETR dropout，train/eval 前向完全一致
-  detr_attention_dropout: 0.0
+  # 正则化（治过拟合）：10-01 实验显示 val CE 从 ep21 起回升（0.62→0.80）、
+  # train CE 0.16（5 倍差），42.6M 参数 vs 1800 张图必须开 dropout。
+  # 与 DETR 原论文一致（attention dropout 0.1 + FFN dropout 0.1）。
+  detr_dropout: 0.1
+  detr_attention_dropout: 0.1
   detr_activation_dropout: 0.0
 
   # Fusion
@@ -103,7 +113,7 @@ train:
   grad_accum: 2                  # 等效 batch 16
   optimizer: "adamw"
   lr: 1.0e-4
-  weight_decay: 1.0e-4
+  weight_decay: 5.0e-4               # 1e-4 → 5e-4：对抗过拟合（val loss U 型回升）
   backbone_lr: 1.0e-5           # Swin/IR backbone 微调 lr
   scheduler: "cosine"
   warmup_steps: 1000
