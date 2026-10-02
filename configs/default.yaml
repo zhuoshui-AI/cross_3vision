@@ -7,7 +7,7 @@ data:
   # val_split 不填 = 从训练集按 val_ratio 切出验证集（测试集无标注，不适合做 val）
   # val_split: "/HUBU-AI027/AIdemo/测试集/AIC2026_PHASE_1_1000"
   val_ratio: 0.1                # 从训练集切 10% 当 val（2000 张 → 200 val）
-  test_split: "/HUBU-AI027/AIdemo/测试集/AIC2026_PHASE_1_1000"  # 仅 inference 用
+  test_split: "/HUBU-AI027/AI_competition/data/AIC2026_PHASE_2_1000"  # 复赛测试集，仅 inference 用
   img_size: 512                # 训练/推理统一边长（Swin 下采样 32x → 特征图 16x16）
   num_workers: 8
 
@@ -123,6 +123,6 @@ loss:
 
 # ---- Inference ----
 inference:
-  conf_threshold: 0.05          # 过滤低置信度；空图也写空文件
-  max_dets_per_image: 100       # 赛题上限
-  output_dir: "./outputs/predictions"
+  conf_threshold: 0.0           # 0 = 保留全部 100 个 query 预测（mAP 评测按置信度排序，低分框不拉低精度）
+  max_dets_per_image: 100       # 赛题上限，超出按置信度截断
+  output_dir: "./outputs/predictions_phase2"   # phase_2 复赛输出，避免覆盖 phase_1
