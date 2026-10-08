@@ -25,4 +25,3 @@ outputs/
 Thumbs.db
 .DS_Store
 example_data/
-# COCO 热启动权重已通过 git-lfs 入库（weights/detr-resnet-50-coco/）
