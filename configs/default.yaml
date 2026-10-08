@@ -109,8 +109,8 @@ id2label:
 # ---- Training ----
 train:
   epochs: 150
-  batch_size: 8
-  grad_accum: 2                  # 等效 batch 16
+  batch_size: 1
+  grad_accum: 16                 # 等效 batch 16（与原 8×2 保持一致，避免收敛行为突变）
   optimizer: "adamw"
   lr: 1.0e-4
   weight_decay: 5.0e-4               # 1e-4 → 5e-4：对抗过拟合（val loss U 型回升）
