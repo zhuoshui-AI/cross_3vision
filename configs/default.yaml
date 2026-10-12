@@ -108,7 +108,7 @@ id2label:
 
 # ---- Training ----
 train:
-  epochs: 150
+  epochs: 600
   batch_size: 1
   grad_accum: 16                 # 等效 batch 16（与原 8×2 保持一致，避免收敛行为突变）
   optimizer: "adamw"
