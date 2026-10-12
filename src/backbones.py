@@ -286,13 +286,18 @@ class RGBIRResNetBackbone(nn.Module):
         预训练权重的 γ/β 仿射参数键名与 BN 相同，可直接复制，
         running_mean/var 丢弃不用。
 
-    输出：多尺度特征列表 [C3, C4, C5]（高分辨率 → 低分辨率）：
+    输出：多尺度特征列表 [C2, C3, C4, C5]（高分辨率 → 低分辨率）：
+        C2 (B, 256,  H/4,  W/4)   layer1
         C3 (B, 512,  H/8,  W/8)   layer2
         C4 (B, 1024, H/16, W/16)  layer3
         C5 (B, 2048, H/32, W/32)  layer4
     通道适配交给下游 SimpleFPN 的 lateral 1x1 卷积完成（此处不再自带
     单尺度 adapter）——极小目标在 stride-32 上不足一个 cell，是漏检的
-    结构性根源，必须把 stride-8/16 特征送进检测头。
+    结构性根源；w≈0.02-0.09 的目标（如 4×9px@192）连 stride-8 都不足
+    一个 cell，必须提供 stride-4 层级。
+    注意：freeze_stages=1 时 layer1（C2 来源）被冻结，C2 是固定的
+    ImageNet 通用边缘/纹理特征，P2 的高层语义由 FPN top-down 补充；
+    FPN 的 lateral/smooth 卷积始终可训练。
     """
 
     def __init__(self, variant="resnet50_imagenet_4ch",
@@ -334,7 +339,7 @@ class RGBIRResNetBackbone(nn.Module):
         self.layer4 = rn.layer4
 
         # 5) 多尺度输出通道（供下游 FPN lateral 使用）
-        self.out_channels = [512, 1024, 2048]
+        self.out_channels = [256, 512, 1024, 2048]
 
         # 6) 阶段冻结：前 freeze_stages 个 stage 冻结以稳定微调；
         #    适配后的 conv1 保持可训练（其权重是重派生的，需要梯度继续适应 IR 模态）
@@ -367,14 +372,14 @@ class RGBIRResNetBackbone(nn.Module):
     def forward(self, x):
         """x: (B, 4, H, W)，前 3 通道为 ImageNet 归一化的 RGB，第 4 通道为 [0,1] IR。
 
-        返回 [C3, C4, C5]（高分辨率 → 低分辨率），通道数 512/1024/2048。
+        返回 [C2, C3, C4, C5]（高分辨率 → 低分辨率），通道数 256/512/1024/2048。
         """
         f = self.stem(x)
-        f = self.layer1(f)
-        c3 = self.layer2(f)          # (B, 512,  H/8,  W/8)
-        c4 = self.layer3(c3)        # (B, 1024, H/16, W/16)
-        c5 = self.layer4(c4)        # (B, 2048, H/32, W/32)
-        return [c3, c4, c5]
+        c2 = self.layer1(f)          # (B, 256,  H/4,  W/4)
+        c3 = self.layer2(c2)         # (B, 512,  H/8,  W/8)
+        c4 = self.layer3(c3)         # (B, 1024, H/16, W/16)
+        c5 = self.layer4(c4)         # (B, 2048, H/32, W/32)
+        return [c2, c3, c4, c5]
 
 
 class _AnyThermalAdapter(nn.Module):

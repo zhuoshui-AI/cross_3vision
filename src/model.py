@@ -32,7 +32,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from transformers import DetrConfig, DetrForObjectDetection
-from transformers.models.detr.modeling_detr import DetrObjectDetectionOutput
+from transformers.models.detr.modeling_detr import (
+    DetrAttention, DetrObjectDetectionOutput)
 
 from .backbones import (
     SwinRGBBackbone, IRBackbone, DepthEncoder, SwinModalityBackbone,
@@ -328,10 +329,11 @@ class RGBIRFusionBackbone(nn.Module):
 
     处理流程：
       1) RGB(3ch) 与 IR(1ch) 通道拼接 → 4ch，送入 RGBIRResNetBackbone
-         （ImageNet 预训练 ResNet50，conv1 适配 4 通道）→ 多尺度 C3/C4/C5；
-      2) SimpleFPN（top-down + PAN bottom-up）→ P3/P4/P5（stride 8/16/32，
+         （ImageNet 预训练 ResNet50，conv1 适配 4 通道）→ 多尺度 C2~C5；
+      2) SimpleFPN（top-down + PAN bottom-up）→ P2~P5（stride 4/8/16/32，
          d_model 通道）——极小目标（w≈0.02-0.09 归一化）在 stride-32 上
-         不足一个 cell，是漏检的结构性根源，必须让 encoder 直接看到 P3/P4；
+         不足一个 cell，是漏检的结构性根源；w≈0.02 的目标（4×9px@192）
+         连 stride-8 都不足一个 cell，必须提供 stride-4 层级；
       3) 深度图(1ch) + 有效掩码(1ch) → DepthEncoder 轻量 CNN → stride-32 特征；
          交叉注意力在 P5（最粗尺度，与 DepthEncoder 输出对齐）注入：
          Q = P5，K=V = 深度特征，深度无效像素经 key_padding_mask 屏蔽。
@@ -346,14 +348,14 @@ class RGBIRFusionBackbone(nn.Module):
     intermediate_channel_sizes = [256]  # DetrModel.__init__ 会访问的兼容属性
 
     # FPN 输出层级：高分辨率 → 低分辨率（与返回列表顺序一致）
-    fpn_strides = [8, 16, 32]
+    fpn_strides = [4, 8, 16, 32]
 
     def __init__(self, cfg):
         super().__init__()
         mcfg = cfg["model"]
         d_model = int(mcfg["d_model"])
 
-        # ---- 1) RGB+IR 四通道联合 ResNet50 主干（输出 C3/C4/C5）----
+        # ---- 1) RGB+IR 四通道联合 ResNet50 主干（输出 C2~C5）----
         # 子模块命名为 rgbir_backbone，train.py 依据该名称把它归入
         # backbone 参数组（使用更小的 backbone_lr 微调）。
         self.rgbir_backbone = RGBIRResNetBackbone(
@@ -361,7 +363,7 @@ class RGBIRFusionBackbone(nn.Module):
             freeze_stages=int(mcfg.get("resnet_freeze_stages", 1)),
         )
 
-        # ---- 2) FPN：C3/C4/C5 → P3/P4/P5（全部 d_model 通道）----
+        # ---- 2) FPN：C2~C5 → P2~P5（全部 d_model 通道）----
         # lateral 1x1 负责通道适配（ResNet 不再自带单尺度 adapter）。
         self.fpn = SimpleFPN(self.rgbir_backbone.out_channels, d_model)
 
@@ -386,9 +388,9 @@ class RGBIRFusionBackbone(nn.Module):
 
         # 通道拼接：(B,3,H,W) + (B,1,H,W) → (B,4,H,W)
         x4 = torch.cat([rgb, ir], dim=1)
-        # 四通道联合 ResNet50 → C3/C4/C5，FPN → P3/P4/P5（高→低分辨率）
-        c3, c4, c5 = self.rgbir_backbone(x4)
-        p3, p4, p5 = self.fpn([c3, c4, c5])
+        # 四通道联合 ResNet50 → C2~C5，FPN → P2~P5（高→低分辨率）
+        c2, c3, c4, c5 = self.rgbir_backbone(x4)
+        p2, p3, p4, p5 = self.fpn([c2, c3, c4, c5])
         # 深度分支 → (B, d_model, H/32, W/32)，在 P5 上做交叉注意力注入
         f_depth = self.depth_encoder(depth, depth_mask)
         depth_mask_ds = DepthEncoder.downsample_mask(
@@ -396,7 +398,7 @@ class RGBIRFusionBackbone(nn.Module):
         p5 = self.depth_fuse(p5, f_depth, depth_mask_ds)
 
         # pixel_mask 逐级下采样到各特征图尺寸（与 DetrConvEncoder 行为一致）
-        feats = [p3, p4, p5]
+        feats = [p2, p3, p4, p5]
         out = []
         for f in feats:
             if pixel_mask is None:
@@ -410,20 +412,128 @@ class RGBIRFusionBackbone(nn.Module):
         return out
 
 
+class _SDPADetrAttention(DetrAttention):
+    """DetrAttention 的 SDPA 版本：数学等价，显存 O(N)。
+
+    HF 4.57 的 DetrAttention 是 eager 实现——显式物化 [B*heads, N, N]
+    注意力矩阵（bmm → softmax → dropout → bmm）。P2 层级加入后
+    N=21760（512 输入），单层 fp16 注意力矩阵 ≈ 7.6GB，6 层 encoder
+    直接撑爆 24GB。SDPA（flash / mem-efficient kernel）不物化矩阵，
+    激活 O(N)，整模型 <4GB。
+
+    与 eager 逐行对应：
+      - q * scaling（head_dim^-0.5）= SDPA 默认 scale；
+      - self-attn 的 V 取未加位置编码的原始 hidden_states；
+      - cross-attn 的 K 加 spatial_position_embeddings、V 取原始 KV；
+      - bool mask True→-inf 的语义与 eager 第 508-511 行一致；
+      - attention_dropout 语义 = SDPA dropout_p（仅训练期生效）。
+    output_attentions=True 时回退 eager（保持注意力可视化可用）。
+    """
+
+    @classmethod
+    def from_detr(cls, attn: DetrAttention) -> "_SDPADetrAttention":
+        new = cls(attn.embed_dim, attn.num_heads, dropout=attn.dropout)
+        new.load_state_dict(attn.state_dict())
+        return new.to(attn.q_proj.weight.device, attn.q_proj.weight.dtype)
+
+    def forward(self, hidden_states, attention_mask=None, object_queries=None,
+                key_value_states=None, spatial_position_embeddings=None,
+                output_attentions=False):
+        if output_attentions:
+            return super().forward(
+                hidden_states, attention_mask=attention_mask,
+                object_queries=object_queries,
+                key_value_states=key_value_states,
+                spatial_position_embeddings=spatial_position_embeddings,
+                output_attentions=True)
+
+        is_cross_attention = key_value_states is not None
+        batch_size, target_len, embed_dim = hidden_states.size()
+
+        # 与 eager 相同：Q 侧加 object_queries，K/V 侧区分原始/加位置版本
+        if object_queries is not None:
+            hidden_states_original = hidden_states
+            hidden_states = hidden_states + object_queries
+        else:
+            hidden_states_original = hidden_states
+        if spatial_position_embeddings is not None:
+            key_value_states_original = key_value_states
+            key_value_states = key_value_states + spatial_position_embeddings
+
+        # 注意：eager 在 q_proj 后乘 self.scaling（=head_dim^-0.5），而 SDPA
+        # 会在内部再乘一次默认 scale —— 这里绝不能预缩放，否则双重缩放。
+        query_states = self._shape(
+            self.q_proj(hidden_states), target_len, batch_size)
+        if is_cross_attention:
+            key_states = self._shape(
+                self.k_proj(key_value_states), -1, batch_size)
+            value_states = self._shape(
+                self.v_proj(key_value_states_original), -1, batch_size)
+        else:
+            key_states = self._shape(
+                self.k_proj(hidden_states), -1, batch_size)
+            value_states = self._shape(
+                self.v_proj(hidden_states_original), -1, batch_size)
+
+        # mask 处理：全零（无 padding）→ None，启用 flash kernel；
+        # 有 padding → 加性 mask 交给 mem-efficient kernel（O(N) 显存）。
+        attn_mask = None
+        if attention_mask is not None:
+            if attention_mask.dtype == torch.bool:
+                # eager 语义：True = 屏蔽
+                if bool(attention_mask.any()):
+                    attn_mask = torch.zeros_like(
+                        attention_mask, dtype=query_states.dtype
+                    ).masked_fill_(attention_mask, -torch.inf)
+            else:
+                # encoder/decoder 传入的加性 float mask（0=真实，<0=padding）
+                if bool((attention_mask < 0).any()):
+                    attn_mask = attention_mask
+
+        out = F.scaled_dot_product_attention(
+            query_states, key_states, value_states, attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            scale=self.scaling)
+        out = out.transpose(1, 2).reshape(
+            batch_size, target_len, embed_dim)
+        return self.out_proj(out), None
+
+
+def install_sdpa_attention(detr_model):
+    """把 detr_model 中全部 eager DetrAttention 替换为 SDPA 版本（权重保留）。
+
+    覆盖 encoder self-attn、decoder self-attn、decoder cross-attn。
+    对小 N（如 tri_swin 的 1280 token）无收益也无害；对大 N（P2 级
+    21760 token）是 24GB 显存上能否训练的前提。
+    """
+    n = 0
+    for block in detr_model.encoder.layers:
+        block.self_attn = _SDPADetrAttention.from_detr(block.self_attn)
+        n += 1
+    for block in detr_model.decoder.layers:
+        block.self_attn = _SDPADetrAttention.from_detr(block.self_attn)
+        block.encoder_attn = _SDPADetrAttention.from_detr(block.encoder_attn)
+        n += 2
+    return n
+
+
 class RGBIRResNetDETR(DetrForObjectDetection):
-    """RGB+IR 通道拼接 ResNet50 + FPN 多尺度 + 深度交叉注意力 + DETR 检测头。
+    """RGB+IR 通道拼接 ResNet50 + FPN 多尺度(P2~P5) + 深度交叉注意力 + DETR。
 
     架构（rgbir_resnet）：
       RGB(3) ─┐ 通道拼接
-      IR(1)  ─┴→ 4ch ResNet50(ImageNet) ─→ FPN → P3/P4/P5 ─┐
-                                                          ├→ DETR encoder
-      Depth(1)+mask(1) → 轻量 CNN ──交叉注意力注入 P5 ──────┘
+      IR(1)  ─┴→ 4ch ResNet50(ImageNet) ─→ FPN → P2/P3/P4/P5 ─┐
+                                                             ├→ DETR encoder
+      Depth(1)+mask(1) → 轻量 CNN ──交叉注意力注入 P5 ─────────┘
 
-    P3/P4/P5（stride 8/16/32）各自展平为 token 拼接后送入 encoder
+    P2~P5（stride 4/8/16/32）各自展平为 token 拼接后送入 encoder
     （每个尺度附加可学习的 scale embedding 以区分层级）。512 输入下
-    共 64²+32²+16² = 5376 token，注意力显存随平方增长；显存不足时
-    可在 config 用 rgbir_encoder_scales 砍掉 stride-8 层（如 [16, 32]），
-    P3 的细节仍会经 PAN bottom-up 通路汇入 P4/P5。
+    共 128²+64²+32²+16² = 21760 token —— 只有配合 SDPA 注意力
+    （install_sdpa_attention，O(N) 显存）才能在 24GB 卡上训练；
+    eager 实现单层注意力矩阵就要 ~7.6GB。显存吃紧时可在 config 用
+    rgbir_encoder_scales 降级（如 [8, 16, 32] = 5376 token 或
+    [16, 32] = 1280 token），被砍层级的细节仍经 PAN bottom-up 通路
+    汇入保留层级。
 
     继承 HuggingFace DetrForObjectDetection：匈牙利匹配、CE/L1/GIoU
     损失、辅助损失、后处理全部复用；仅替换 conv_encoder 并改写 forward
@@ -449,9 +559,9 @@ class RGBIRResNetDETR(DetrForObjectDetection):
         conv_encoder = RGBIRFusionBackbone(cfg)
         self.model.backbone.conv_encoder = conv_encoder
         # 送入 encoder 的 FPN 层级（高分辨率 → 低分辨率），以及区分层级的
-        # 可学习尺度嵌入。默认全部三层。
+        # 可学习尺度嵌入。默认 P2~P5 全开（21760 token@512，需 SDPA 注意力）。
         self.encoder_strides = [int(s) for s in cfg["model"].get(
-            "rgbir_encoder_scales", [8, 16, 32])]
+            "rgbir_encoder_scales", [4, 8, 16, 32])]
         unknown = set(self.encoder_strides) - set(conv_encoder.fpn_strides)
         if unknown:
             raise ValueError(
@@ -459,6 +569,9 @@ class RGBIRResNetDETR(DetrForObjectDetection):
                 f"可选值: {conv_encoder.fpn_strides}")
         self.scale_embed = nn.Embedding(len(self.encoder_strides), d_model)
         nn.init.normal_(self.scale_embed.weight, std=0.02)
+        # eager DetrAttention 物化 [B*heads, N, N] 矩阵，P2 级 token 量下
+        # 必爆显存 —— 全部换成数学等价的 SDPA 实现（O(N) 激活）。
+        install_sdpa_attention(self.model)
         # 只初始化新建的 input_projection。
         # 注意：这里绝不能调用 self.post_init()！super().__init__ 已初始化
         # DETR 编码器/解码器/检测头，RGBIRFusionBackbone 内部也已加载
