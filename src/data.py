@@ -175,9 +175,13 @@ class MultiModalDataset(Dataset):
         they break the cross-modal spatial alignment the fusion relies on.
 
         正则化（治过拟合，10-01 实验证据）：crop 下限 0.5→0.4 增强尺度扰动；
-        另在 __getitem__ 里对 RGB 单独做轻度亮度/对比度抖动 —— albumentations
-        的 additional_targets 会把光度变换同等地作用到 IR/depth 上，而热图
-        和深度是物理量，绝不能做光度增强，所以光度抖动必须手工只加给 RGB。
+        另在 __getitem__ 里对 RGB 单独做光度增强、对 IR 做热图对比度/噪声
+        增强、对深度做传感器噪声/脱落模拟 —— albumentations 的
+        additional_targets 会把光度变换同等地作用到所有模态上，而热图
+        和深度是物理量，各模态的光度增强必须手工单独施加。
+
+        深度 validity mask 以 additional_target "depth_valid"（mask 类型，
+        最近邻插值）与深度图共享同一套几何变换，保证像素级对齐。
         """
         if train:
             transforms = [
@@ -188,6 +192,17 @@ class MultiModalDataset(Dataset):
                 ),
                 A.HorizontalFlip(p=0.5),
             ]
+            # ---- 训练期各模态光度增强器（仅 train 生效）----
+            # CLAHE 对象复用于 RGB-L 通道与 IR 单通道（clip=2.0, tile=8x8）
+            self._clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            self._shadow = A.RandomShadow(p=0.25)
+            # 触发概率集中管理（消融时改这里）
+            self._p_rgb_clahe = 0.30
+            self._p_ir_clahe = 0.30     # 热图局部对比度：弱热信号目标更醒目
+            self._p_ir_noise = 0.30     # 高斯噪声：模拟传感器热噪声
+            self._p_ir_denoise = 0.15   # 中值滤波：模拟"干净/模糊"传感器两态
+            self._p_depth_noise = 0.30  # 有效像素高斯噪声（20~80mm 量级）
+            self._p_depth_dropout = 0.20  # 随机深度脱落（模拟传感器空洞）
         else:
             transforms = [
                 _make_transform(A.Resize, self.img_size,
@@ -200,7 +215,8 @@ class MultiModalDataset(Dataset):
                 label_fields=["class_labels"],
                 min_visibility=0.1,
             ),
-            additional_targets={"ir": "image", "depth": "image"},
+            additional_targets={"ir": "image", "depth": "image",
+                                "depth_valid": "mask"},
         )
 
     def __len__(self):
@@ -232,6 +248,23 @@ class MultiModalDataset(Dataset):
             depth = depth[..., None] if depth.ndim == 2 else depth[..., :1]
             depth_is_mm = False
 
+        # ---- 深度空洞邻域填充（确定性预处理：train/val/推理三阶段一致）----
+        # 无效像素（16bit: <10mm / >20000mm 哨兵；8bit: 0）在 resize 线性
+        # 插值时会把 0 值拖进有效区边缘形成假梯度；先做 3x3 邻域均值外扩
+        # 填充。填充像素在 validity mask 中仍标记无效 —— 合成值只给
+        # DepthEncoder CNN 当局部上下文，不作为真值进入深度交叉注意力。
+        if depth_is_mm:
+            depth_invalid = (depth[..., 0] < 10.0) | (depth[..., 0] > 20000.0)
+        else:
+            depth_invalid = depth[..., 0] <= 0.0
+        invalid_frac = float(depth_invalid.mean())
+        if 0.0 < invalid_frac <= 0.5:  # 全无效样本跳过（mask 已兜底）
+            filled = self._fill_depth_holes(depth[..., 0], depth_invalid)
+            depth = filled[..., None]
+        # validity mask（255=有效）作为 mask 类型的 additional_target，
+        # 与深度图共享几何变换（最近邻插值，不做平滑）
+        depth_valid_u8 = (~depth_invalid).astype(np.uint8) * 255
+
         boxes, class_labels = load_label(
             os.path.join(self.label_dir, stem + ".txt"), self.num_classes)
 
@@ -247,15 +280,25 @@ class MultiModalDataset(Dataset):
             box_list, label_list = [], []
 
         data = self.transform(
-            image=rgb, ir=ir, depth=depth,
+            image=rgb, ir=ir, depth=depth, depth_valid=depth_valid_u8,
             bboxes=box_list, class_labels=label_list,
         )
         rgb_t = data["image"]
         ir_t = data["ir"]
         depth_t = data["depth"]
-        # RGB-only 光度抖动（训练时）：IR 热图与深度是物理量，不做光度增强。
+        # 变换后的 validity mask（mask 类型走最近邻插值，值域仍为 0/255）
+        dv = np.asarray(data["depth_valid"])
+        depth_valid = dv.astype(bool) if dv.dtype == bool else dv > 127
+
+        # ---- 训练期光度增强（各模态独立；val/推理不执行）----
         if self.train:
+            # RGB：亮度/对比度抖动 + CLAHE + 随机阴影
             rgb_t = self._jitter_rgb(rgb_t)
+            rgb_t = self._augment_rgb_train(rgb_t)
+            # IR：CLAHE（热图局部对比度，弱热信号目标更醒目）
+            #      + 高斯噪声（模拟传感器热噪声）
+            #      + 中值滤波（模拟干净/模糊传感器两态）
+            ir_t = self._augment_ir_train(ir_t)
         H2, W2 = rgb_t.shape[:2]
         # Albumentations may broadcast a single-channel "image" to 3 channels
         # depending on version/interpolation; force IR and depth back to a
@@ -286,7 +329,12 @@ class MultiModalDataset(Dataset):
 
         pixel_rgb = self._normalize_rgb(rgb_t)
         pixel_ir = self._normalize_ir(ir_t)
-        pixel_depth, depth_mask = self._normalize_depth(depth_t, depth_is_mm)
+        pixel_depth, depth_mask = self._normalize_depth(
+            depth_t, depth_is_mm, depth_valid)
+        # 深度传感器噪声/脱落模拟（仅训练期）
+        if self.train:
+            pixel_depth, depth_mask = self._augment_depth_train(
+                pixel_depth, depth_mask)
 
         target = {
             "class_labels": torch.from_numpy(labels_aug).long(),
@@ -328,26 +376,121 @@ class MultiModalDataset(Dataset):
         return torch.from_numpy(np.ascontiguousarray(x.transpose(2, 0, 1))).float()
 
     @staticmethod
-    def _normalize_depth(depth_hwc, is_mm=True):
-        """Normalize depth to [0,1] and produce a validity mask.
+    def _fill_depth_holes(d2d, invalid, max_iters=32):
+        """3x3 邻域迭代均值填充深度空洞（确定性，cv2 实现，无 scipy 依赖）。
+
+        每轮把"已填充集合"外扩 1px：新填像素取其 8 邻域中已有效像素的
+        均值（等价于低通扩散插值），空洞半径 r 需约 r 轮。返回值仅填充
+        像素变化；invalid 掩码由调用方保留（填充像素仍标记无效）。
+        超过 max_iters 仍未填到的大洞保持原值（mask=0 已兜底）。
+        """
+        if not invalid.any() or invalid.all():
+            return d2d.astype(np.float32, copy=True)
+        out = d2d.astype(np.float32).copy()
+        filled = (~invalid).astype(np.float32)
+        todo = invalid.copy()
+        ones = np.ones((3, 3), np.float32)
+        for _ in range(max_iters):
+            if not todo.any():
+                break
+            cnt = cv2.filter2D(filled, -1, ones,
+                               borderType=cv2.BORDER_CONSTANT)
+            region = todo & (cnt > 0)
+            if not region.any():
+                break
+            ssum = cv2.filter2D(out * filled, -1, ones,
+                                borderType=cv2.BORDER_CONSTANT)
+            out[region] = ssum[region] / cnt[region]
+            filled[region] = 1.0
+            todo = ~filled.astype(bool)
+        return out
+
+    def _augment_rgb_train(self, rgb_hwc):
+        """训练期 RGB 光度增强：CLAHE（LAB-L 通道）+ 随机阴影。
+
+        CLAHE 限制局部对比度增益（clip=2.0），不会像全局直方图均衡那样
+        放大噪声；随机阴影模拟户外光照分布，两者均为温和幅度。
+        """
+        if np.random.rand() < self._p_rgb_clahe:
+            lab = cv2.cvtColor(rgb_hwc, cv2.COLOR_RGB2LAB)
+            lab[..., 0] = self._clahe.apply(lab[..., 0])
+            rgb_hwc = cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+        # RandomShadow 构造时已带 p=0.25，内部自行掷骰
+        rgb_hwc = self._shadow(image=rgb_hwc)["image"]
+        return rgb_hwc
+
+    def _augment_ir_train(self, ir_hwc):
+        """训练期 IR 热图增强（单通道 uint8）。
+
+        CLAHE：热图常有大片低对比区域，弱热信号目标（远处的人/uav）
+        局部对比度拉伸后更醒目；高斯噪声模拟传感器热噪声；中值滤波
+        模拟"干净/模糊"两种传感器状态，教会模型对模糊鲁棒。
+        """
+        c = ir_hwc[..., 0] if ir_hwc.ndim == 3 else ir_hwc
+        if np.random.rand() < self._p_ir_clahe:
+            c = self._clahe.apply(c)
+        if np.random.rand() < self._p_ir_denoise:
+            c = cv2.medianBlur(c, 3)
+        if np.random.rand() < self._p_ir_noise:
+            sigma = float(np.random.uniform(5.0, 15.0))
+            c = np.clip(
+                c.astype(np.float32)
+                + np.random.normal(0.0, sigma, c.shape), 0, 255
+            ).astype(np.uint8)
+        return c[..., None]
+
+    @staticmethod
+    def _augment_depth_train(depth_chw, valid_mask):
+        """训练期深度传感器噪声/脱落模拟（归一化后施加）。
+
+        1) 高斯噪声：仅在有效像素上，σ 取量程的 0.1%~0.4%（≈20~80mm），
+           模拟深度传感器的测量抖动；
+        2) 随机脱落：2~5 个小矩形区域整体置无效，模拟传感器空洞/反光
+           失效——推理时的深度图经常出现这类缺失，训练期见过才能鲁棒。
+        """
+        if torch.rand(()) < 0.30:
+            sigma = float(torch.empty(1).uniform_(0.001, 0.004))
+            noisy = (depth_chw + torch.randn_like(depth_chw) * sigma
+                     ).clamp(0.0, 1.0)
+            depth_chw = torch.where(valid_mask, noisy, depth_chw)
+        if torch.rand(()) < 0.20:
+            _, H, W = depth_chw.shape
+            n_holes = int(torch.randint(2, 6, ()))
+            for _ in range(n_holes):
+                rw = int(torch.randint(max(2, W // 50), max(3, W // 12) + 1, ()))
+                rh = int(torch.randint(max(2, H // 50), max(3, H // 12) + 1, ()))
+                x0 = int(torch.randint(0, max(1, W - rw), ()))
+                y0 = int(torch.randint(0, max(1, H - rh), ()))
+                valid_mask[y0:y0 + rh, x0:x0 + rw] = False
+                depth_chw[:, y0:y0 + rh, x0:x0 + rw] = 0.0
+        return depth_chw, valid_mask
+
+    @staticmethod
+    def _normalize_depth(depth_hwc, is_mm=True, valid=None):
+        """Normalize depth to [0,1]; invalid pixels zeroed.
 
         Two input formats coexist in this dataset:
           - 16-bit mm PNG (is_mm=True):  range [0, 19999] mm, invalid if <10 or >20000.
           - 8-bit pre-normalized JPG (is_mm=False): range [0, 255], no mm
             semantics; treat 0 as invalid but keep the rest.
+        valid: 变换后的 (H, W) bool 掩码（与深度图共享几何变换）；
+               为 None 时按值域推断（兼容旧调用方式）。
         Both produce a (1, H, W) float tensor in ~[0,1] and a (H, W) bool mask.
         """
         x = depth_hwc.astype(np.float32)
         if is_mm:
-            valid = (x >= 10.0) & (x <= 20000.0)
             x = np.clip(x, 0.0, 20000.0) / 20000.0
         else:
-            valid = x > 0.0
             x = x / 255.0
+        if valid is None:
+            if is_mm:
+                valid = (depth_hwc[..., 0] >= 10.0) & (depth_hwc[..., 0] <= 20000.0)
+            else:
+                valid = depth_hwc[..., 0] > 0.0
         x[~valid] = 0.0
         tensor = torch.from_numpy(
             np.ascontiguousarray(x.transpose(2, 0, 1))).float()
-        mask = torch.from_numpy(np.ascontiguousarray(valid[..., 0])).bool()
+        mask = torch.from_numpy(np.ascontiguousarray(valid)).bool()
         return tensor, mask
 
 

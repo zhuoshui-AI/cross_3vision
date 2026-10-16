@@ -8,7 +8,7 @@ data:
   # val_split: "/HUBU-AI027/AIdemo/测试集/AIC2026_PHASE_1_1000"
   val_ratio: 0.1                # 从训练集切 10% 当 val（2000 张 → 200 val）
   test_split: "/HUBU-AI027/AI_competition/data/AIC2026_PHASE_2_1000"  # 复赛测试集，仅 inference 用
-  img_size: 512                # 训练/推理统一边长（Swin 下采样 32x → 特征图 16x16）
+  img_size: 640                # 训练/推理统一边长（Swin 下采样 32x → 特征图 16x16）
   num_workers: 8
 
 # ---- Model ----
