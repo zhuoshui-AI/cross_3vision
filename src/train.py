@@ -373,6 +373,31 @@ def train(cfg, resume=None, restart=None):
         log.info(f"(git 信息不可用: {e})")
 
 
+def _apply_overrides(cfg, overrides):
+    """把 `model.arch=tri_swin` 形式的点路径覆盖进 cfg dict.
+
+    值用 yaml.safe_load 解析，所以 `model.tri_fuse_stages=[1,2,3,4]` 会变成
+    真正的 list；`model.img_size=640` 会是 int；字符串加不加引号都可以。
+    """
+    import yaml as _yaml
+    for expr in overrides or []:
+        if "=" not in expr:
+            raise ValueError(f"--set 必须是 key=value 形式，得到: {expr!r}")
+        key, val = expr.split("=", 1)
+        key = key.strip()
+        try:
+            parsed = _yaml.safe_load(val)
+        except Exception:
+            parsed = val  # 解析失败就当纯字符串
+        node = cfg
+        parts = key.split(".")
+        for p in parts[:-1]:
+            if p not in node or not isinstance(node[p], dict):
+                node[p] = {}
+            node = node[p]
+        node[parts[-1]] = parsed
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", default="configs/default.yaml")
@@ -381,10 +406,15 @@ def main():
                     help="断点续训：恢复权重+optimizer+scheduler+epoch")
     ap.add_argument("--restart", default=None,
                     help="热重启：只载入权重，新 cosine 周期从头退火")
+    ap.add_argument("--set", action="append", default=None,
+                    metavar="KEY=VALUE",
+                    help="点路径覆盖，可多次指定；值用 yaml 解析："
+                         "model.arch=tri_swin, model.tri_fuse_stages=[1,2,3,4]")
     args = ap.parse_args()
     cfg = load_yaml_config(args.config)
     if args.data_root:
         cfg["data"]["data_root"] = args.data_root
+    _apply_overrides(cfg, args.set)
     train(cfg, resume=args.resume, restart=args.restart)
 
 
