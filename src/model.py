@@ -887,6 +887,11 @@ class TriModalSwinDETR(DetrForObjectDetection):
         # kept and reused in forward().
         self.model.backbone.conv_encoder = nn.Identity()
         self.model.input_projection = nn.Identity()
+        # 与 RGBIRResNetDETR 同因：P2 层 stride-4 在 640 输入下产生
+        # 160² = 25600 token，四层合计 262400 token。eager 注意力
+        # attention 矩阵 262400² × 2B ≈ 137 GB，24GB 卡必爆。
+        # 换成数学等价的 SDPA 实现（flash attention，O(N·d) 激活）。
+        install_sdpa_attention(self.model)
         # No post_init(): see MultiModalSwinDETR for why a second init would
         # destroy pretrained backbone weights.
         prior_prob = 0.01
@@ -1154,19 +1159,26 @@ def warm_start_detr_head(model, source="facebook/detr-resnet-50"):
 
 
 def build_model(cfg):
-    """Factory: DetrConfig → detection model, selected by model.arch."""
+    """Factory: DetrConfig → detection model, selected by model.arch.
+
+    COCO DETR 头热启动统一放在分发之后：encoder/decoder/bbox_predictor/
+    query_position 的权重形状与 token 数量、与 backbone 完全无关，
+    rgbir_resnet 与 tri_swin 共用同一套先验。
+    cssa_detr 保留旧行为（不热启动）。
+    """
     config = build_detr_config(cfg)
     arch = cfg["model"].get("arch", "cssa_detr")
     if arch == "rgbir_resnet":
         model = RGBIRResNetDETR(config, cfg=cfg)
-        # COCO 预训练热启动检测头（小数据集 recipe；detr_warm_start 置空禁用）
-        warm = cfg["model"].get("detr_warm_start")
-        if warm:
-            warm_start_detr_head(model, warm)
-        return model
-    if arch == "tri_swin":
-        return TriModalSwinDETR(config, cfg=cfg)
-    if arch == "cssa_detr":
+    elif arch == "tri_swin":
+        model = TriModalSwinDETR(config, cfg=cfg)
+    elif arch == "cssa_detr":
         return MultiModalSwinDETR(config, cfg=cfg)
-    raise ValueError(f"Unknown model.arch: {arch!r} "
-                     "(expected 'rgbir_resnet', 'tri_swin' or 'cssa_detr')")
+    else:
+        raise ValueError(f"Unknown model.arch: {arch!r} "
+                         "(expected 'rgbir_resnet', 'tri_swin' or 'cssa_detr')")
+
+    warm = cfg["model"].get("detr_warm_start")
+    if warm:
+        warm_start_detr_head(model, warm)
+    return model
