@@ -351,6 +351,27 @@ def train(cfg, resume=None, restart=None):
 
     log.info(f"Training done. Best mAP@50-95 = {best:.4f}")
 
+    # ---- 训练结束时输出 git 版本号 + 最近一次提交摘要 ----
+    import subprocess as _sp
+    try:
+        def _run_git(*args):
+            return _sp.check_output(
+                ["git", "-C", os.path.dirname(os.path.dirname(__file__)), *args],
+                stderr=_sp.DEVNULL, text=True, timeout=10).strip()
+        sha = _run_git("rev-parse", "--short", "HEAD")
+        branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
+        try:
+            last = _run_git("log", "-1", "--format=%s  (%ci)")
+        except _sp.CalledProcessError:
+            last = "(无提交记录)"
+        dirty = bool(_run_git("status", "--porcelain"))
+        log.info(f"--- Git 版本快照 ---")
+        log.info(f"  commit : {sha}  branch : {branch}")
+        log.info(f"  last   : {last}")
+        log.info(f"  dirty  : {'是（有未提交改动）' if dirty else '否'}")
+    except Exception as e:
+        log.info(f"(git 信息不可用: {e})")
+
 
 def main():
     ap = argparse.ArgumentParser()
