@@ -10,14 +10,26 @@ import json
 import math
 import os
 import re
+import sys
+from pathlib import Path
 
 import torch
 from torch.utils.data import DataLoader
 
-from .data import MultiModalDataset, collate_fn
-from .eval import evaluate
-from .model import build_model
-from .utils import (EMA, load_yaml_config, save_ckpt, set_seed, setup_logging)
+# 兼容两种运行方式：
+#   python -m src.train          → 包模式，用相对导入
+#   python src/train.py          → 脚本模式，手动加父目录到 sys.path
+if __package__ is None or __package__ == "":
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+    from src.data import MultiModalDataset, collate_fn
+    from src.eval import evaluate
+    from src.model import build_model
+    from src.utils import (EMA, load_yaml_config, save_ckpt, set_seed, setup_logging)
+else:
+    from .data import MultiModalDataset, collate_fn
+    from .eval import evaluate
+    from .model import build_model
+    from .utils import (EMA, load_yaml_config, save_ckpt, set_seed, setup_logging)
 
 
 def _move_batch(batch, device):
@@ -117,10 +129,31 @@ def _val_loss_pass(model, val_loader, device, cfg):
 
 def train(cfg, resume=None, restart=None):
     tcfg = cfg["train"]
+    arch = cfg["model"].get("arch", "unknown")
+
+    # 根据架构自动隔离输出目录，避免多终端并行训练互相覆盖
+    # 用户也可通过 --set train.ckpt_dir=xxx / train.log_dir=xxx 手动覆盖
+    for key in ("ckpt_dir", "log_dir"):
+        raw = tcfg.get(key) or f"./outputs/{key.replace('_dir','')}"
+        if f"/{arch}" not in raw and f"\\{arch}" not in raw:
+            tcfg[key] = raw.rstrip("/\\") + f"/{arch}"
+
     log = setup_logging(tcfg.get("log_dir"), "multimodal_swin_detr")
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    log.info(f"Device: {device}")
+
+    # 打印清晰的启动 banner，一眼看出本次训练使用的架构
+    log.info("=" * 60)
+    log.info(f"  Network architecture : {arch}")
+    log.info(f"  Device                : {device}")
+    log.info(f"  Image size            : {cfg['data']['img_size']}")
+    log.info(f"  Classes / queries     : {cfg['model']['num_labels']} / {cfg['model']['num_queries']}")
+    log.info(f"  Epochs / batch / accum: {cfg['train']['epochs']} / {cfg['train']['batch_size']} / {cfg['train']['grad_accum']}")
+    log.info(f"  CKPT dir              : {tcfg['ckpt_dir']}")
+    log.info(f"  Log dir               : {tcfg['log_dir']}")
+    if cfg["model"].get("detr_warm_start"):
+        log.info(f"  DETR warm start       : {cfg['model']['detr_warm_start']}")
+    log.info("=" * 60)
 
     img_size = int(cfg["data"]["img_size"])
     ncls = int(cfg["model"]["num_labels"])
