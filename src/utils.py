@@ -84,8 +84,10 @@ class EMA:
             self.shadow[n].mul_(d).add_(p.detach(), alpha=1 - d)
 
     def apply_to(self, model):
-        """Return a state-dict copy with EMA weights swapped in (for eval)."""
-        backup = {n: p.clone() for n, p in model.named_parameters()}
+        """Swap EMA weights into model for eval. Only shadow params need backup
+        — frozen params aren't touched and won't accumulate epoch-over-epoch."""
+        backup = {n: p.clone()
+                  for n, p in model.named_parameters() if n in self.shadow}
         for n, p in model.named_parameters():
             if n in self.shadow:
                 p.data.copy_(self.shadow[n])

@@ -373,6 +373,8 @@ def train(cfg, resume=None, restart=None):
                 log.info(f"  ↑ new best {best:.4f} → best.pth")
         if ema is not None:
             ema.restore(model, ema_backup)
+            del ema_backup
+            torch.cuda.empty_cache() if device == "cuda" else None
 
         stats["epoch"] = epoch
         stats["n_parameters"] = n_parameters
