@@ -781,8 +781,9 @@ class TriModalSwinFusion(nn.Module):
         # （tri_*_depths 减少每阶 block 数，通道维 96/192/384/768 与 stride
         # 4/8/16/32 不变 → HCMAF / FPN 无需改动，预训练权重对保留 block 仍可加载）。
         # IR 是单通道热图、Depth 是几何量，信息量远低于 RGB，等容量即过参数化。
-        ir_freeze = int(mcfg.get("tri_ir_freeze_stages",
-                                 mcfg.get("tri_freeze_stages", 2)))
+        # IR 默认冻 3：单通道热图信息量低，只训最后 stage 以抑制过拟合；
+        # 不再回退到 tri_freeze_stages（那是 RGB 的默认值，语义不同）。
+        ir_freeze = int(mcfg.get("tri_ir_freeze_stages", 3))
         self.rgb_backbone = SwinModalityBackbone(
             variant=mcfg.get("tri_rgb_variant", "swin_tiny_patch4_window7_224"),
             in_chans=3,
