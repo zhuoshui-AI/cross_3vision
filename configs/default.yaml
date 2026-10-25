@@ -41,16 +41,24 @@ model:
   # 置空（null）则禁用热启动
   detr_warm_start: "./weights/detr-resnet-50-coco"
 
-  # ---- TMSC-Det (tri_swin) Lite 配置：三路全部 Swin-T ----
+  # ---- TMSC-Det (tri_swin)：按模态信息量分配容量 ----
+  # IR（单通道热图）与 Depth（几何量）信息量远低于 RGB，等容量 Swin-T（28.3M×3）
+  # 属过参数化、易过拟合；此处按信息量裁剪每阶 block 数。通道维 96/192/384/768
+  # 与 stride 4/8/16/32 保持不变 → HCMAF / FPN 零改动；保留下来的 block 仍可
+  # 完整加载 ImageNet-22k 预训练权重（被裁掉的 block 键会被自动忽略）。
   tri_rgb_variant: "swin_tiny_patch4_window7_224"
   tri_ir_variant: "swin_tiny_patch4_window7_224"
   tri_depth_variant: "swin_tiny_patch4_window7_224"
+  tri_rgb_depths: [2, 2, 6, 2]            # RGB：完整 Swin-T（28.3M，信息量最大，保精度）
+  tri_ir_depths: [1, 1, 2, 2]             # IR：28.3M → 20.6M
+  tri_depth_depths: [1, 1, 2, 1]          # Depth：28.3M → 13.5M（三路主干合计 85M → 62M）
   tri_pretrained_tag: "ms_in22k"          # timm ImageNet-22k 权重标签
   tri_rgb_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
   tri_ir_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
   tri_depth_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
-  tri_freeze_stages: 2                    # RGB/IR 冻结前 2 stage
-  tri_depth_freeze_stages: 1              # Depth 只冻 1 stage（几何模态差异大）
+  tri_freeze_stages: 2                    # RGB 冻结前 2 stage
+  tri_ir_freeze_stages: 3                 # IR 冻结前 3 stage，只训最后 stage（抑制过拟合）
+  tri_depth_freeze_stages: 3              # Depth 同上（几何模态，更依赖通用底层特征）
   # 在 stage1/2/3/4（stride 4/8/16/32）做 HCMAF
   # 新增 stage1 → stride-4 特征让 DETR encoder 能直接看到极小目标
   tri_fuse_stages: [1, 2, 3, 4]

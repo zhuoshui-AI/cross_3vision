@@ -485,7 +485,7 @@ class SwinModalityBackbone(nn.Module):
 
     def __init__(self, variant="swin_tiny_patch4_window7_224", in_chans=3,
                  pretrained=True, pretrained_path=None, pretrained_tag="ms_in22k",
-                 freeze_stages=2, img_size=512, drop_path_rate=0.0):
+                 freeze_stages=2, img_size=512, drop_path_rate=0.0, depths=None):
         super().__init__()
         import os
         if in_chans not in (1, 2, 3):
@@ -498,6 +498,23 @@ class SwinModalityBackbone(nn.Module):
         if pretrained_tag and kwargs.get("pretrained"):
             kwargs["pretrained_cfg"] = pretrained_tag
         kwargs["drop_path_rate"] = float(drop_path_rate)
+        self.depths = tuple(int(d) for d in depths) if depths else None
+        if self.depths is not None:
+            # 轻量化：自定义每阶 block 数，通道维与 stride 不变（96/192/384/768
+            # @ 4/8/16/32），因此 HCMAF 融合零改动。层数与 ImageNet-22k 检查点
+            # 不一致，禁止 timm 从 hub 拉权重（会因键缺失报错）；预训练通过
+            # 本地 pretrained_path 精确加载保留下来的 block（strict=False 忽略
+            # 被裁掉的 block 键）。注意：Depth 的 2ch patch_embed 本就需重训，
+            # 裁减主要影响 IR 的语义迁移能力。
+            kwargs["depths"] = self.depths
+            kwargs["pretrained"] = False
+            kwargs.pop("pretrained_cfg", None)
+            if not path_ok:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "%s: 自定义 depths=%s 需本地预训练权重，但 pretrained_path "
+                    "'%s' 不存在 → 该模态将随机初始化（无 ImageNet 先验）。",
+                    variant, self.depths, pretrained_path)
         try:
             self.swin = timm.create_model(variant, img_size=img_size, **kwargs)
         except TypeError:
@@ -523,9 +540,24 @@ class SwinModalityBackbone(nn.Module):
             # the head anyway (we read per-stage maps before swin.norm).
             state = {k: v for k, v in state.items()
                      if not k.startswith("head.")}
-            self.swin.load_state_dict(state, strict=False)
-            logging.getLogger(__name__).info(
-                "%s: loaded local Swin checkpoint %s", variant, pretrained_path)
+            result = self.swin.load_state_dict(state, strict=False)
+            # 轻量化时检查点里被裁掉的 block 会出现在 unexpected_keys 中，属预期；
+            # 但模型侧不应有「缺权重」的 backbone 键（除 head/norm），否则是
+            # 配置写错（如 depths 与变体不匹配）。
+            model_keys = set(self.swin.state_dict().keys())
+            missing_backbone = [
+                k for k in model_keys - set(state.keys())
+                if not k.startswith(("head.", "norm."))]
+            logger = logging.getLogger(__name__)
+            logger.info(
+                "%s: loaded local Swin checkpoint %s (matched=%d, skipped=%d, "
+                "depths=%s)", variant, pretrained_path,
+                len(model_keys & set(state.keys())),
+                len(result.unexpected_keys), self.depths)
+            if missing_backbone:
+                logger.warning(
+                    "%s: checkpoint 缺以下 backbone 权重（随机初始化）：%s",
+                    variant, missing_backbone[:10])
 
         self._adapt_patch_embed(in_chans)
         if hasattr(self.swin, "patch_embed"):

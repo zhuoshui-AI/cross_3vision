@@ -747,6 +747,12 @@ class TriModalSwinFusion(nn.Module):
     Fused maps at fuse stages (default stages 2/3/4 → stride 8/16/32) go
     through SimpleFPN → P3/P4/P5 at d_model channels.
 
+    Capacity is allocated per modality (`tri_rgb_depths` / `tri_ir_depths` /
+    `tri_depth_depths`): RGB keeps the full Swin-T, while IR (single-channel
+    thermal) and Depth (geometric) use fewer blocks per stage. Channel dims
+    (96/192/384/768) and strides (4/8/16/32) are unchanged, so HCMAF fusion
+    needs no adapters and retained blocks still load the ImageNet-22k weights.
+
     Submodule attribute names (rgb_backbone / ir_backbone / depth_encoder)
     match train.py's backbone-vs-head parameter-group name matching.
     """
@@ -765,25 +771,38 @@ class TriModalSwinFusion(nn.Module):
             v = mcfg.get(key)
             return v if v else None
 
+        def _depths(key):
+            v = mcfg.get(key)
+            return tuple(int(x) for x in v) if v else None
+
         common = dict(pretrained=pretrained, pretrained_tag=tag,
                       img_size=img_size, drop_path_rate=drop_path)
+        # 容量按模态信息量分配：RGB 保留完整 Swin-T，IR / Depth 各自更轻
+        # （tri_*_depths 减少每阶 block 数，通道维 96/192/384/768 与 stride
+        # 4/8/16/32 不变 → HCMAF / FPN 无需改动，预训练权重对保留 block 仍可加载）。
+        # IR 是单通道热图、Depth 是几何量，信息量远低于 RGB，等容量即过参数化。
+        ir_freeze = int(mcfg.get("tri_ir_freeze_stages",
+                                 mcfg.get("tri_freeze_stages", 2)))
         self.rgb_backbone = SwinModalityBackbone(
             variant=mcfg.get("tri_rgb_variant", "swin_tiny_patch4_window7_224"),
             in_chans=3,
             pretrained_path=_path("tri_rgb_pretrained_path"),
-            freeze_stages=int(mcfg.get("tri_freeze_stages", 2)), **common)
+            freeze_stages=int(mcfg.get("tri_freeze_stages", 2)),
+            depths=_depths("tri_rgb_depths"), **common)
         self.ir_backbone = SwinModalityBackbone(
             variant=mcfg.get("tri_ir_variant", "swin_tiny_patch4_window7_224"),
             in_chans=1,
             pretrained_path=_path("tri_ir_pretrained_path"),
-            freeze_stages=int(mcfg.get("tri_freeze_stages", 2)), **common)
+            freeze_stages=ir_freeze,
+            depths=_depths("tri_ir_depths"), **common)
         # Depth is a geometric modality: freeze fewer stages so the 2ch-adapted
         # stem can adapt faster.
         self.depth_encoder = SwinModalityBackbone(
             variant=mcfg.get("tri_depth_variant", "swin_tiny_patch4_window7_224"),
             in_chans=2,
             pretrained_path=_path("tri_depth_pretrained_path"),
-            freeze_stages=int(mcfg.get("tri_depth_freeze_stages", 1)), **common)
+            freeze_stages=int(mcfg.get("tri_depth_freeze_stages", 1)),
+            depths=_depths("tri_depth_depths"), **common)
 
         embed_dim = self.rgb_backbone.embed_dim
         self._branches = (self.rgb_backbone, self.ir_backbone, self.depth_encoder)
