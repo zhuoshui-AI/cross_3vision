@@ -440,6 +440,13 @@ class _SDPADetrAttention(DetrAttention):
                 key_value_states=None, spatial_position_embeddings=None,
                 output_attentions=False):
         if output_attentions:
+            # eager 实现会断言 mask 形状为 (B, 1, tgt_len, src_len)，而我们
+            # 的省显存掩码是 (B, 1, 1, src_len)（query 维恒定）。expand 成
+            # 视图即可满足断言，不额外占显存。
+            if (attention_mask is not None and attention_mask.dim() == 4
+                    and attention_mask.shape[2] == 1):
+                attention_mask = attention_mask.expand(
+                    -1, -1, hidden_states.shape[1], -1)
             return super().forward(
                 hidden_states, attention_mask=attention_mask,
                 object_queries=object_queries,
@@ -499,13 +506,38 @@ class _SDPADetrAttention(DetrAttention):
         return self.out_proj(out), None
 
 
+def _prepare_compact_attention_mask(mask, dtype, tgt_len=None):
+    """`_prepare_4d_attention_mask` 的省显存实现。
+
+    HF 的实现会物化 (B, 1, query_len, key_len) 的 float 掩码。tri_swin 在
+    640 输入、FPN 四层全开时 encoder token 数 N=34000，该张量
+    34000×34000×4B ≈ 4.3 GiB —— 即使注意力已换成 SDPA，也会在 encoder
+    入口 OOM（SDPA 只省掉了注意力矩阵本身，绕不过这个前置掩码）。
+
+    key-padding 掩码在 query 维恒为同一值，因此只需保留 (B, 1, 1, key_len)，
+    由 SDPA / eager 广播：显存从 O(N²) 降到 O(N)。数值语义与 HF 一致
+    （真实位置 0，padding 位置 finfo.min）。
+    """
+    inverted = 1.0 - mask.to(dtype)
+    return inverted.masked_fill(
+        inverted.to(torch.bool), torch.finfo(dtype).min
+    ).unsqueeze(1).unsqueeze(1)
+
+
 def install_sdpa_attention(detr_model):
     """把 detr_model 中全部 eager DetrAttention 替换为 SDPA 版本（权重保留）。
 
     覆盖 encoder self-attn、decoder self-attn、decoder cross-attn。
     对小 N（如 tri_swin 的 1280 token）无收益也无害；对大 N（P2 级
     21760 token）是 24GB 显存上能否训练的前提。
+
+    同时把 HF 的 4D 掩码展开替换成省显存版本（见
+    `_prepare_compact_attention_mask`）：encoder 的 N×N 掩码是 OOM 的
+    第一现场，仅替换注意力实现并不够。
     """
+    import transformers.models.detr.modeling_detr as hf_detr
+    hf_detr._prepare_4d_attention_mask = _prepare_compact_attention_mask
+
     n = 0
     for block in detr_model.encoder.layers:
         block.self_attn = _SDPADetrAttention.from_detr(block.self_attn)
