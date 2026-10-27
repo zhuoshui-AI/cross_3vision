@@ -1249,9 +1249,21 @@ def main():
 
     # ---- 1. Training curves ----
     print("\n=== 1. Parsing training log ===")
-    log_data = parse_log(args.log_file)
+    log_file = args.log_file
+    if not os.path.isfile(log_file):
+        # 训练日志已改为按 run_id 时间戳命名（log_<run_id>.txt）；
+        # 默认路径不存在时自动回退到同目录下最新的一个
+        import glob as _glob
+        cands = sorted(
+            _glob.glob(os.path.join(os.path.dirname(log_file) or ".",
+                                    "log_*.txt")),
+            key=os.path.getmtime)
+        if cands:
+            log_file = cands[-1]
+            print(f"  {args.log_file} 不存在，改用最新日志 {log_file}")
+    log_data = parse_log(log_file)
     n_eps = len(log_data.get("epochs", []))
-    print(f"  Found {n_eps} epochs in {args.log_file}")
+    print(f"  Found {n_eps} epochs in {log_file}")
     curve_imgs = plot_training_curves(log_data, out_dir, class_names)
     all_images.extend(curve_imgs)
     if curve_imgs:

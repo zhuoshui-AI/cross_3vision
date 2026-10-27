@@ -80,6 +80,22 @@ def evaluate(model, val_loader, device, cfg, amp_enabled=False, conf_th=0.0):
         return v
 
     map_all, mar_all = _f("map"), _f("mar_100")
+
+    # 逐类别 AP@50-95：torchmetrics 以 classes/map_per_class 平行数组返回，
+    # 无 GT 的类别为 -1；转成 {类名: ap} 方便日志直接打印。
+    per_class_ap = None
+    try:
+        id2label = {int(k): str(v) for k, v in (cfg.get("id2label") or {}).items()}
+        # 注意：单类别时 torchmetrics 返回标量 tensor，tolist() 是 int 而非 list
+        classes = torch.atleast_1d(res["classes"]).tolist()
+        ap_list = torch.atleast_1d(res["map_per_class"]).tolist()
+        per_class_ap = {}
+        for cid, ap in zip(classes, ap_list):
+            name = id2label.get(int(cid), f"class_{int(cid)}")
+            per_class_ap[name] = float(ap) if ap >= 0 else None
+    except (KeyError, AttributeError):
+        per_class_ap = None
+
     return {
         "map_5095": map_all,
         "map_50": _f("map_50"),
@@ -94,5 +110,5 @@ def evaluate(model, val_loader, device, cfg, amp_enabled=False, conf_th=0.0):
         "mar_small": _f("mar_small") if _f("mar_small") >= 0 else mar_all,
         "mar_medium": _f("mar_medium") if _f("mar_medium") >= 0 else mar_all,
         "mar_large": _f("mar_large") if _f("mar_large") >= 0 else mar_all,
-        "per_class_ap": res.get("map_per_class", None),
+        "per_class_ap": per_class_ap,
     }

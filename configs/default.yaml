@@ -136,6 +136,12 @@ train:
   log_dir: "./outputs/logs"
   ckpt_dir: "./outputs/ckpt"
   val_interval: 5
+  # ---- 早停（监控验证 mAP@50-95）----
+  # early_stop_patience: 连续 N 次验证（每 val_interval 个 epoch 一次）无显著
+  #                      提升则停训；0 = 关闭
+  # early_stop_min_delta: 提升幅度超过该值才算"显著提升"
+  early_stop_patience: 0
+  early_stop_min_delta: 0.0
 
 # Loss weights (DETR 默认)
 loss:

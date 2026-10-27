@@ -2,6 +2,7 @@
 import logging
 import os
 import random
+import time
 import yaml
 import torch
 
@@ -19,9 +20,15 @@ def load_yaml_config(path):
         return yaml.safe_load(fh)
 
 
-def setup_logging(log_dir=None, name="multimodal_swin_detr"):
+def setup_logging(log_dir=None, name="multimodal_swin_detr", run_id=None):
+    """每次运行写独立的时间戳日志文件（train_<run_id>.log），避免多次
+    训练的日志混在同一文件里。run_id 挂在 logger.run_id 上，供调用方
+    给其他产物（如 JSONL 训练日志）取同名。"""
+    if run_id is None:
+        run_id = time.strftime("%Y%m%d_%H%M%S")
     os.makedirs(log_dir, exist_ok=True) if log_dir else None
     logger = logging.getLogger(name)
+    logger.run_id = run_id
     if logger.handlers:
         return logger
     logger.setLevel(logging.INFO)
@@ -31,9 +38,11 @@ def setup_logging(log_dir=None, name="multimodal_swin_detr"):
     ch.setFormatter(fmt)
     logger.addHandler(ch)
     if log_dir:
-        fh = logging.FileHandler(os.path.join(log_dir, "train.log"))
+        log_path = os.path.join(log_dir, f"train_{run_id}.log")
+        fh = logging.FileHandler(log_path)
         fh.setFormatter(fmt)
         logger.addHandler(fh)
+        logger.log_file = log_path
     return logger
 
 

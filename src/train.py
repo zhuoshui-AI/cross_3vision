@@ -272,10 +272,20 @@ def train(cfg, resume=None, restart=None):
     val_interval = int(tcfg["val_interval"])
     grad_clip = float(tcfg["grad_clip"])
 
+    # ---- 早停（以验证 mAP@50-95 为监控指标）----
+    es_patience = int(tcfg.get("early_stop_patience", 0))
+    es_min_delta = float(tcfg.get("early_stop_min_delta", 0.0))
+    es_bad_evals = 0          # 连续无提升的验证次数
+    early_stop = False
+    if es_patience > 0:
+        log.info(f"Early stopping ON : patience={es_patience} 次验证, "
+                 f"min_delta={es_min_delta}")
+
     # ---- DETR 风格 per-epoch JSONL 日志（对齐 facebook/detr 的 log.txt）----
+    # 与文本日志共用同一 run_id 时间戳 → 每次训练一对独立文件，互不混淆
     log_dir = tcfg.get("log_dir") or "./outputs/logs"
     os.makedirs(log_dir, exist_ok=True)
-    jsonl_path = os.path.join(log_dir, "log.txt")
+    jsonl_path = os.path.join(log_dir, f"log_{log.run_id}.txt")
     loss_weights = {k: float(v) for k, v in cfg.get("loss", {}).items()}
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     log.info(f"DETR-style epoch log → {jsonl_path} "
@@ -354,6 +364,14 @@ def train(cfg, resume=None, restart=None):
             log.info(f"Val ep{epoch}: mAP@50-95={score:.4f} "
                      f"mAP@50={metrics.get('map_50', float('nan')):.4f}"
                      + (" (EMA)" if ema else ""))
+            # 逐类别 AP@50-95（无 GT 的类别显示 n/a），同时写入 JSONL
+            pc_ap = metrics.get("per_class_ap")
+            if pc_ap:
+                stats["test_per_class_ap"] = pc_ap
+                log.info(f"  Per-class AP@50-95 (ep{epoch}):")
+                for _name, _ap in pc_ap.items():
+                    log.info(f"    {_name:12s}: "
+                             + ("n/a (no GT)" if _ap is None else f"{_ap:.4f}"))
             # COCO 标准 12 项顺序；本数据集只有小目标，s/m/l 槽位重复填
             # 全量值（对应原 DETR log 的 test_coco_eval_bbox 字段）
             coco12 = [
@@ -366,11 +384,22 @@ def train(cfg, resume=None, restart=None):
             ]
             stats["test_coco_eval_bbox"] = [
                 float(x) if x is not None else None for x in coco12]
+            prev_best = best
             if score == score and score > best:  # not NaN & improved
                 best = score
                 save_ckpt(os.path.join(ckpt_dir, "best.pth"),
                           model, optimizer, scheduler, epoch, best, cfg)
                 log.info(f"  ↑ new best {best:.4f} → best.pth")
+            # ---- 早停计数：提升幅度 ≤ min_delta 视为无提升 ----
+            if es_patience > 0:
+                if score == score and score > prev_best + es_min_delta:
+                    es_bad_evals = 0
+                else:
+                    es_bad_evals += 1
+                    log.info(f"  early-stop: {es_bad_evals}/{es_patience} "
+                             f"次验证无显著提升")
+                if es_bad_evals >= es_patience:
+                    early_stop = True
         if ema is not None:
             ema.restore(model, ema_backup)
             del ema_backup
@@ -383,6 +412,12 @@ def train(cfg, resume=None, restart=None):
 
         save_ckpt(os.path.join(ckpt_dir, "last.pth"),
                   model, optimizer, scheduler, epoch, best, cfg)
+
+        if early_stop:
+            log.info(f"Early stopping triggered at epoch {epoch}: "
+                     f"连续 {es_patience} 次验证 mAP@50-95 提升 "
+                     f"≤ {es_min_delta}。best={best:.4f}")
+            break
 
     log.info(f"Training done. Best mAP@50-95 = {best:.4f}")
 
