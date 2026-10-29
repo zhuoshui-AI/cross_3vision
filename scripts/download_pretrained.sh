@@ -21,8 +21,10 @@ fi
 # Also let timm cache its own 22k tag so train-time load is network-free:
 python -c "import timm; timm.create_model('swin_small_patch4_window7_224', pretrained=True, pretrained_cfg='ms_in22k')" || true
 
-# ---- 2. AnyThermal (IR branch, optional) ----
+# ---- 2. AnyThermal (tri_swin IR tower, optional) ----
 # CMU ICRA 2026 DINOv2-distilled ViT-B/14 thermal backbone.
+# 下载后在 configs/default.yaml 中设 model.tri_ir_backbone: "anythermal"
+# （model.tri_ir_anythermal_path 默认指向 ./weights/AnyThermal）。
 # Requires `pip install huggingface-hub`.
 if [ "${WITH_ANYTHERMAL:-0}" = "1" ]; then
   echo "Downloading AnyThermal from HuggingFace..."

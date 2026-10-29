@@ -6,9 +6,12 @@
   projected to match Swin's channel count.
 - DepthEncoder: lightweight 5-stride-2 CNN, depth + validity mask as 2-channel
   input; no pretraining (depth is geometric signal, trained from 0).
+- AnyThermalBackbone: DINOv2-distilled ViT-B/14 thermal foundation model
+  disguised as a 4-stage Swin tower (tri_swin IR branch option).
 """
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 import torchvision
 
@@ -268,120 +271,6 @@ class IRBackbone(nn.Module):
         return self.adapter(f)
 
 
-class RGBIRResNetBackbone(nn.Module):
-    """RGB+IR 四通道联合 ResNet50 主干（rgbir_resnet 架构）。
-
-    核心思路：
-      - RGB(3ch) 与 IR(1ch) 在输入端直接通道拼接成 4 通道，
-        由同一支 ResNet50 联合提取特征 —— 早期融合让两种模态
-        在浅层卷积阶段即可互补交互（IR 提供热目标，RGB 提供纹理细节）。
-      - conv1 从预训练 3 通道权重适配到 4 通道：
-          * 前 3 通道：原样保留 ImageNet 预训练的 RGB 权重；
-          * 第 4 通道（IR）：取 3 组 RGB 权重的均值 —— IR 是灰度
-            热图，均值滤波等于"对三个颜色滤波器响应求平均"，
-            保持输出量级与 RGB 通道一致。
-      - BatchNorm 全部替换为 GroupNorm（与 IRBackbone 相同技巧）：
-        小 batch 下 BN 的 train/eval 统计切换会导致训练与验证
-        行为不一致，GroupNorm 无运行统计量、两种模式完全一致。
-        预训练权重的 γ/β 仿射参数键名与 BN 相同，可直接复制，
-        running_mean/var 丢弃不用。
-
-    输出：多尺度特征列表 [C2, C3, C4, C5]（高分辨率 → 低分辨率）：
-        C2 (B, 256,  H/4,  W/4)   layer1
-        C3 (B, 512,  H/8,  W/8)   layer2
-        C4 (B, 1024, H/16, W/16)  layer3
-        C5 (B, 2048, H/32, W/32)  layer4
-    通道适配交给下游 SimpleFPN 的 lateral 1x1 卷积完成（此处不再自带
-    单尺度 adapter）——极小目标在 stride-32 上不足一个 cell，是漏检的
-    结构性根源；w≈0.02-0.09 的目标（如 4×9px@192）连 stride-8 都不足
-    一个 cell，必须提供 stride-4 层级。
-    注意：freeze_stages=1 时 layer1（C2 来源）被冻结，C2 是固定的
-    ImageNet 通用边缘/纹理特征，P2 的高层语义由 FPN top-down 补充；
-    FPN 的 lateral/smooth 卷积始终可训练。
-    """
-
-    def __init__(self, variant="resnet50_imagenet_4ch",
-                 pretrained_path=None, freeze_stages=1):
-        super().__init__()
-        import os
-        self.variant = variant
-        self.freeze_stages = int(freeze_stages)
-
-        # 1) 构建 GroupNorm 版 ResNet50（不加载在线权重，norm_layer 替换 BN）
-        rn = torchvision.models.resnet50(weights=None, norm_layer=_group_norm)
-
-        # 2) 加载本地 ImageNet 预训练权重（仅仿射参数 γ/β 能对上，
-        #    running_mean/var 为多余键，strict=False 自动忽略）
-        path_ok = bool(pretrained_path) and os.path.isfile(pretrained_path)
-        if path_ok:
-            state = torch.load(pretrained_path, map_location="cpu")
-            rn.load_state_dict(state, strict=False)
-        else:
-            import logging
-            logging.getLogger(__name__).warning(
-                "RGBIRResNetBackbone: 预训练权重 '%s' 不存在，将使用随机初始化。"
-                "请先运行 scripts/download_pretrained.sh 下载到 weights/ 目录。",
-                pretrained_path)
-
-        # 3) conv1 适配 3ch → 4ch（前 3 通道保留 RGB 权重，第 4 通道取均值）
-        old_w = rn.conv1.weight.detach()          # (64, 3, 7, 7)
-        rn.conv1 = nn.Conv2d(4, 64, kernel_size=7, stride=2,
-                             padding=3, bias=False)
-        with torch.no_grad():
-            rn.conv1.weight[:, :3].copy_(old_w)                     # RGB 通道
-            rn.conv1.weight[:, 3:4].copy_(old_w.mean(dim=1, keepdim=True))  # IR 通道
-
-        # 4) 只保留特征提取所需部分（stem + layer1~4，丢弃分类头 fc）
-        self.stem = nn.Sequential(rn.conv1, rn.bn1, rn.relu, rn.maxpool)
-        self.layer1 = rn.layer1
-        self.layer2 = rn.layer2
-        self.layer3 = rn.layer3
-        self.layer4 = rn.layer4
-
-        # 5) 多尺度输出通道（供下游 FPN lateral 使用）
-        self.out_channels = [256, 512, 1024, 2048]
-
-        # 6) 阶段冻结：前 freeze_stages 个 stage 冻结以稳定微调；
-        #    适配后的 conv1 保持可训练（其权重是重派生的，需要梯度继续适应 IR 模态）
-        if self.freeze_stages >= 1:
-            for p in self.layer1.parameters():
-                p.requires_grad = False
-        if self.freeze_stages >= 2:
-            for p in self.layer2.parameters():
-                p.requires_grad = False
-        if self.freeze_stages >= 3:
-            for p in self.layer3.parameters():
-                p.requires_grad = False
-
-    def train(self, mode=True):
-        """冻结的 stage 始终保持 eval 模式。
-
-        model.train() 会把所有子模块切到训练模式，若不固定，
-        冻结层内的随机行为（如有）会在训练/验证间产生分布差异。
-        """
-        super().train(mode)
-        if mode:
-            if self.freeze_stages >= 1:
-                self.layer1.eval()
-            if self.freeze_stages >= 2:
-                self.layer2.eval()
-            if self.freeze_stages >= 3:
-                self.layer3.eval()
-        return self
-
-    def forward(self, x):
-        """x: (B, 4, H, W)，前 3 通道为 ImageNet 归一化的 RGB，第 4 通道为 [0,1] IR。
-
-        返回 [C2, C3, C4, C5]（高分辨率 → 低分辨率），通道数 256/512/1024/2048。
-        """
-        f = self.stem(x)
-        c2 = self.layer1(f)          # (B, 256,  H/4,  W/4)
-        c3 = self.layer2(c2)         # (B, 512,  H/8,  W/8)
-        c4 = self.layer3(c3)         # (B, 1024, H/16, W/16)
-        c5 = self.layer4(c4)         # (B, 2048, H/32, W/32)
-        return [c2, c3, c4, c5]
-
-
 class _AnyThermalAdapter(nn.Module):
     """Thin wrapper around AnyThermal ViT-B/14 (placeholder for swap-in later).
 
@@ -479,6 +368,9 @@ class SwinModalityBackbone(nn.Module):
       - in_chans=2 (Depth): channel 0 = mean of the 3 pretrained sets fed with
         normalized depth; channel 1 (validity mask) = zero weights, learned
         during training. Bias is copied in all cases.
+      - in_chans=4 (RGB+IR early fusion, rgbir_swin): channels 0-2 keep the
+        pretrained RGB weights; channel 3 (IR grayscale) = mean of the 3
+        pretrained sets (same recipe as the removed RGBIRResNetBackbone conv1).
 
     forward returns a list of 4 feature maps [C1..C4] at stride 4/8/16/32.
     """
@@ -488,8 +380,8 @@ class SwinModalityBackbone(nn.Module):
                  freeze_stages=2, img_size=512, drop_path_rate=0.0, depths=None):
         super().__init__()
         import os
-        if in_chans not in (1, 2, 3):
-            raise ValueError(f"in_chans must be 1/2/3, got {in_chans}")
+        if in_chans not in (1, 2, 3, 4):
+            raise ValueError(f"in_chans must be 1/2/3/4, got {in_chans}")
         self.in_chans = in_chans
         path_ok = bool(pretrained_path) and os.path.isfile(pretrained_path)
         # Always construct the 3-channel model first so pretrained weights load
@@ -587,6 +479,12 @@ class SwinModalityBackbone(nn.Module):
         with torch.no_grad():
             if in_chans == 1:
                 new.weight.copy_(old.weight.sum(dim=1, keepdim=True))
+            elif in_chans == 4:
+                # RGB+IR 早期融合：前 3 通道保留预训练 RGB 权重，
+                # 第 4 通道（IR 灰度）取 RGB 三组权重的均值 —— IR 响应
+                # 量级与 RGB 通道一致（与旧 ResNet 版 conv1 适配同策略）。
+                new.weight[:, :3].copy_(old.weight)
+                new.weight[:, 3:4].copy_(old.weight.mean(dim=1, keepdim=True))
             else:  # 2 channels: depth (mean of RGB sets) + zeroed mask channel
                 new.weight[:, 0:1].copy_(old.weight.mean(dim=1, keepdim=True))
                 nn.init.zeros_(new.weight[:, 1:2])
@@ -596,7 +494,7 @@ class SwinModalityBackbone(nn.Module):
 
     def _freeze_stages(self):
         if self.freeze_stages >= 1:
-            # Keep the ADAPTED patch_embed trainable for 1ch/2ch inputs: its
+            # Keep the ADAPTED patch_embed trainable for 1ch/2ch/4ch inputs: its
             # weights were re-derived (sum/mean) from the 3ch pretrained conv,
             # and the depth mask channel starts at zero — both need gradients
             # to adapt. Only the stock 3ch stem is frozen.
@@ -618,7 +516,7 @@ class SwinModalityBackbone(nn.Module):
         """Keep frozen stages in eval() (see SwinRGBBackbone for rationale)."""
         super().train(mode)
         if mode and self.freeze_stages >= 1:
-            if self.in_chans == 3:  # adapted (1ch/2ch) stems stay trainable
+            if self.in_chans == 3:  # adapted (1ch/2ch/4ch) stems stay trainable
                 self.swin.patch_embed.eval()
             if hasattr(self.swin, "pos_drop"):
                 self.swin.pos_drop.eval()
@@ -687,3 +585,258 @@ class SwinModalityBackbone(nn.Module):
             feats = self.run_stage(i, feats)
             outs.append(self.nhwc_to_nchw(feats))
         return outs
+
+
+# ======================================================================
+# AnyThermal: thermal foundation model as a pseudo Swin tower (tri_swin IR)
+# ======================================================================
+
+def _read_tensor_file(path):
+    """读入单个权重文件（.pth/.pt/.bin 走 torch.load，.safetensors 走专用接口）。"""
+    if path.endswith(".safetensors"):
+        from safetensors.torch import load_file
+        return load_file(path)
+    state = torch.load(path, map_location="cpu")
+    if not isinstance(state, dict):
+        raise RuntimeError(f"{path} 不是张量字典")
+    return state
+
+
+def _remap_hf_dinov2(state):
+    """HuggingFace DINOv2 命名 → timm 命名（DINOv2 的 QKV 本就是融合单线性）。
+
+    对应关系：embeddings.patch_embeddings.projection → patch_embed.proj、
+    attention.attention → attn.qkv、attention.output.dense → attn.proj、
+    layernorm_before/after → norm1/norm2、mlp.intermediate/output.dense →
+    mlp.fc1/fc2。
+    """
+    out = {}
+    for k, v in state.items():
+        nk = k
+        if nk.startswith("encoder.layer."):
+            nk = "blocks." + nk[len("encoder.layer."):]
+        nk = (nk
+              .replace("embeddings.patch_embeddings.projection.",
+                       "patch_embed.proj.")
+              .replace(".attention.attention.", ".attn.qkv.")
+              .replace(".attention.output.dense.", ".attn.proj.")
+              .replace(".layernorm_before.", ".norm1.")
+              .replace(".layernorm_after.", ".norm2.")
+              .replace(".mlp.intermediate.dense.", ".mlp.fc1.")
+              .replace(".mlp.output.dense.", ".mlp.fc2."))
+        if nk == "embeddings.cls_token":
+            nk = "cls_token"
+        elif nk == "embeddings.position_embeddings":
+            nk = "pos_embed"
+        elif nk.startswith("layernorm."):
+            nk = "norm." + nk[len("layernorm."):]
+        out[nk] = v
+    return out
+
+
+def _load_anythermal_state(path, vit_model=None):
+    """读取 AnyThermal 检查点 → timm vit_base_patch14_dinov2 的 state_dict。
+
+    兼容常见三种布局：
+      - timm / Meta DINOv2 布局：patch_embed.proj / blocks.N.attn.qkv…
+        直接使用；
+      - HuggingFace 布局：embeddings.* / encoder.layer.N.* 自动重命名；
+      - 训练封装：student. / module. / backbone. / model. 前缀自动剥离，
+        {'model': ..., 'state_dict': ...} 等嵌套字典自动解包。
+    pos_embed 网格不匹配时按 timm resample_abs_pos_embed 插值。
+    path 可为权重文件，或目录（自动递归检索 .pth/.pt/.bin/.safetensors）。
+    """
+    import glob
+    import logging
+    import os
+
+    log = logging.getLogger(__name__)
+    if os.path.isdir(path):
+        cands = []
+        for ext in ("*.pth", "*.pt", "*.bin", "*.safetensors"):
+            cands += sorted(glob.glob(os.path.join(path, "**", ext),
+                                      recursive=True))
+        if not cands:
+            raise RuntimeError(
+                f"AnyThermal 目录 {path!r} 中没有 .pth/.pt/.bin/.safetensors "
+                "权重。先运行 scripts/download_pretrained.sh WITH_ANYTHERMAL=1 "
+                "下载 theairlabcmu/AnyThermal，或把 model.tri_ir_backbone 改回 "
+                "\"swin\"。")
+        state, used = None, None
+        for cand in cands:
+            try:
+                state = _read_tensor_file(cand)
+                used = cand
+                break
+            except Exception:
+                continue
+        if state is None:
+            raise RuntimeError(f"AnyThermal 权重读取失败，试过: {cands}")
+        log.info("AnyThermal: 使用检查点文件 %s", used)
+    elif os.path.isfile(path):
+        state = _read_tensor_file(path)
+    else:
+        raise RuntimeError(
+            f"AnyThermal 权重不存在: {path!r}。先运行 "
+            "scripts/download_pretrained.sh WITH_ANYTHERMAL=1 下载 "
+            "theairlabcmu/AnyThermal（或把 tri_ir_backbone 改回 \"swin\"）。")
+
+    # 解包训练封装（{'model': ...} / {'student': ...} 等嵌套字典）
+    while isinstance(state, dict) and not any(
+            torch.is_tensor(v) for v in state.values()):
+        wrapped = [k for k in ("model", "state_dict", "model_state_dict",
+                               "module", "student", "teacher", "backbone",
+                               "net") if k in state]
+        if len(wrapped) != 1:
+            break
+        state = state[wrapped[0]]
+    for prefix in ("module.", "student.", "backbone.", "model."):
+        if any(k.startswith(prefix) for k in state):
+            state = {k[len(prefix):] if k.startswith(prefix) else k: v
+                     for k, v in state.items()}
+            break
+
+    # timm 布局判定：patch_embed.proj.weight 存在即直接用，否则尝试 HF 重命名
+    if "patch_embed.proj.weight" not in state:
+        state = _remap_hf_dinov2(state)
+
+    # pos_embed 网格不匹配 → resample（保留 cls token 行）
+    if vit_model is not None and "pos_embed" in state \
+            and state["pos_embed"].shape != vit_model.pos_embed.shape:
+        try:
+            from timm.layers import resample_abs_pos_embed
+            old_l = state["pos_embed"].shape[1]
+            old_g = int(round((old_l - 1) ** 0.5))
+            new_g = int(vit_model.patch_embed.grid_size[0])
+            n_pre = old_l - old_g * old_g
+            state["pos_embed"] = resample_abs_pos_embed(
+                state["pos_embed"], new_size=(new_g, new_g),
+                old_size=(old_g, old_g), num_prefix_tokens=n_pre)
+            log.info("AnyThermal pos_embed 网格 %dx%d → %dx%d 已插值",
+                     old_g, old_g, new_g, new_g)
+        except Exception as e:
+            del state["pos_embed"]
+            log.warning("AnyThermal pos_embed 插值失败（%s），使用模型默认。", e)
+    return state
+
+
+class AnyThermalBackbone(nn.Module):
+    """AnyThermal（DINOv2 蒸馏 ViT-B/14 热红外基础模型）伪 Swin 塔（tri_swin IR 分支）。
+
+    来源：theairlabcmu/AnyThermal（CMU，DINOv2-distilled ViT-B/14 thermal
+    backbone），用 scripts/download_pretrained.sh WITH_ANYTHERMAL=1 下载到
+    weights/AnyThermal/ 后，把 model.tri_ir_backbone 设为 "anythermal" 启用。
+
+    ViT 是非层级结构，而 HCMAF 要求三塔在 stride 4/8/16/32 上输出同构
+    特征图 —— 这里把 ViT 伪装成 Swin 塔：
+      - stem_maps：IR(1ch) 复制成 3ch + ImageNet 归一化 → resize 到
+        518（37×14 原生网格）→ 冻结 ViT 全前向 → patch token（768 维）
+        重排为特征图，缓存供各 stage 复用；
+      - run_stage(i)：token 图双线性插值到 stage i 分辨率 → 1x1 卷积
+        投影到该 stage 通道数（96/192/384/768）。
+    HCMAF 的 z_maps 反馈在本分支被丢弃（ViT 没有 stage 可回灌，IR 特征
+    每层静态重投影）；与 Swin 塔的窗口填充分辨率差 1~3 px 时，由
+    TriModalSwinFusion.forward 的逐 stage 对齐插值兜底。
+
+    ViT 主体整体冻结（基础模型 + 2k 图微调必过拟合），仅训练逐层 1x1
+    投影；tri_ir_variant / tri_ir_depths / tri_ir_freeze_stages 对本
+    分支无效。
+    """
+
+    VIT_IMG = 518          # ViT-B/14 原生输入边长（37×37 patch 网格）
+    PATCH = 14
+
+    def __init__(self, weights_path, embed_dim=96, num_stages=4):
+        super().__init__()
+        import logging
+        if not weights_path:
+            raise RuntimeError(
+                "AnyThermal 需要权重路径（model.tri_ir_anythermal_path）。"
+                "先运行 scripts/download_pretrained.sh WITH_ANYTHERMAL=1。")
+        self.vit = timm.create_model(
+            "vit_base_patch14_dinov2", pretrained=False, num_classes=0)
+        state = _load_anythermal_state(weights_path, self.vit)
+        own = self.vit.state_dict()
+        matched = [k for k, v in state.items()
+                   if k in own and own[k].shape == v.shape]
+        if "patch_embed.proj.weight" not in matched \
+                or sum(k.startswith("blocks.") for k in matched) < 6:
+            raise RuntimeError(
+                f"AnyThermal 检查点与 ViT-B/14 结构不匹配（matched="
+                f"{len(matched)}，样例键: {list(state.keys())[:10]}）。"
+                "请确认 tri_ir_anythermal_path 指向 DINOv2 布局的 "
+                "ViT-B/14 权重。")
+        result = self.vit.load_state_dict(state, strict=False)
+        cov = sum(own[k].numel() for k in matched) \
+            / max(1, sum(p.numel() for p in self.vit.parameters()))
+        logging.getLogger(__name__).info(
+            "AnyThermal ViT-B/14 载入 %s：参数覆盖率 %.1f%%"
+            "（missing=%d, unexpected=%d）",
+            weights_path, 100.0 * cov,
+            len(result.missing_keys), len(result.unexpected_keys))
+        # 冻结基础模型：仅训逐层 1x1 投影
+        for p in self.vit.parameters():
+            p.requires_grad = False
+
+        self.embed_dim = int(embed_dim)
+        vit_dim = int(self.vit.embed_dim)
+        self.stage_proj = nn.ModuleList([
+            nn.Conv2d(vit_dim, embed_dim * (2 ** i), 1, bias=False)
+            for i in range(num_stages)])
+        self.out_channels = [embed_dim * (2 ** i) for i in range(num_stages)]
+        self._tokens = None
+        self.register_buffer(
+            "_mean", torch.tensor((0.485, 0.456, 0.406)).view(1, 3, 1, 1))
+        self.register_buffer(
+            "_std", torch.tensor((0.229, 0.224, 0.225)).view(1, 3, 1, 1))
+
+    def freeze_foundation(self):
+        """显式冻结 ViT 主体（供 unfreeze_backbone 之后恢复冻结态）。"""
+        for p in self.vit.parameters():
+            p.requires_grad = False
+
+    def train(self, mode=True):
+        """训练模式下 ViT 也保持 eval（与其余冻结塔语义一致）。"""
+        super().train(mode)
+        if mode:
+            self.vit.eval()
+        return self
+
+    def _forward_vit(self, x):
+        """x: (B,1,H,W) [0,1] → 冻结 ViT 的 patch 特征 (B, D, 37, 37)。"""
+        v = self.vit
+        img = x.repeat(1, 3, 1, 1)                 # 1ch 热图 → 3ch
+        img = (img - self._mean) / self._std       # ImageNet 归一化（DINOv2 协议）
+        if img.shape[-2:] != (self.VIT_IMG, self.VIT_IMG):
+            img = F.interpolate(img, size=(self.VIT_IMG, self.VIT_IMG),
+                                mode="bilinear", align_corners=False)
+        toks = v.forward_features(img)            # (B, 1+37*37, D)，已过最终 LN
+        toks = toks[:, getattr(v, "num_prefix_tokens", 1):]   # 丢弃 cls token
+        g = self.VIT_IMG // self.PATCH
+        return toks.transpose(1, 2).reshape(-1, v.embed_dim, g, g)
+
+    def stem_maps(self, x):
+        """ViT 全前向一次并缓存 token 图；返回 ceil(H/4) 分辨率的 768ch 伪 stem。"""
+        B, _, H, W = x.shape
+        self._tokens = self._forward_vit(x)
+        h4, w4 = (H + 3) // 4, (W + 3) // 4
+        fmap = F.interpolate(self._tokens, size=(h4, w4),
+                             mode="bilinear", align_corners=False)
+        return fmap.permute(0, 2, 3, 1).contiguous()   # (B, h4, w4, 768) NHWC
+
+    def run_stage(self, i, m):
+        """token 图插值到 stage i 分辨率 → 1x1 投影到该 stage 通道数（NHWC 输出）。
+
+        m 是上一层输出 / HCMAF 反馈图：本分支不消费其内容（z 反馈被丢弃），
+        仅用其形状推导目标分辨率 —— stage 0 直接复用 stem 的 768ch 伪图；
+        stage i>0 按 PatchMerging 的奇数进位 ceil(m/2) 估算，与 Swin 塔
+        的窗口填充差异由融合循环的对齐插值兜底。
+        """
+        if i == 0:
+            fmap = m.permute(0, 3, 1, 2)           # (B, 768, h4, w4)
+        else:
+            th, tw = (m.shape[1] + 1) // 2, (m.shape[2] + 1) // 2
+            fmap = F.interpolate(self._tokens, size=(th, tw),
+                                 mode="bilinear", align_corners=False)
+        out = self.stage_proj[i](fmap)
+        return out.permute(0, 2, 3, 1).contiguous()

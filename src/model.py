@@ -37,7 +37,7 @@ from transformers.models.detr.modeling_detr import (
 
 from .backbones import (
     SwinRGBBackbone, IRBackbone, DepthEncoder, SwinModalityBackbone,
-    RGBIRResNetBackbone)
+    AnyThermalBackbone)
 from .fusion import CSSAFusion, DepthLateFusion, HCMAFBlock, SimpleFPN
 
 
@@ -320,23 +320,29 @@ class MultiModalSwinDETR(DetrForObjectDetection):
                 p.requires_grad = True
 
 
-class RGBIRFusionBackbone(nn.Module):
-    """RGB+IR 早期拼接 + 深度交叉注意力融合主干（rgbir_resnet 架构）。
+class RGBIRSwinFusionBackbone(nn.Module):
+    """RGB+IR 早期拼接 4 通道 Swin-T(22k) + 深度交叉注意力（rgbir_swin 架构）。
 
     替换 DetrModel.backbone 中的 DetrConvEncoder，forward 返回
-    [(feature_map, mask)]，与 DetrConvEncoder 的返回契约一致，
+    [(feature_map, mask), ...]，与 DetrConvEncoder 的返回契约一致，
     因此位置编码等下游逻辑完全复用 HuggingFace 原实现。
 
     处理流程：
-      1) RGB(3ch) 与 IR(1ch) 通道拼接 → 4ch，送入 RGBIRResNetBackbone
-         （ImageNet 预训练 ResNet50，conv1 适配 4 通道）→ 多尺度 C2~C5；
-      2) SimpleFPN（top-down + PAN bottom-up）→ P2~P5（stride 4/8/16/32，
-         d_model 通道）——极小目标（w≈0.02-0.09 归一化）在 stride-32 上
-         不足一个 cell，是漏检的结构性根源；w≈0.02 的目标（4×9px@192）
-         连 stride-8 都不足一个 cell，必须提供 stride-4 层级；
-      3) 深度图(1ch) + 有效掩码(1ch) → DepthEncoder 轻量 CNN → stride-32 特征；
-         交叉注意力在 P5（最粗尺度，与 DepthEncoder 输出对齐）注入：
+      1) RGB(3ch) 与 IR(1ch) 通道拼接 → 4ch，送入 SwinModalityBackbone
+         （ImageNet-22k 预训练，patch_embed 适配 4 通道：前 3 通道保留
+         RGB 权重、IR 通道取 RGB 三组权重均值；适配后的 patch_embed 保持
+         可训练）→ 多尺度 C1~C4（96/192/384/768 @ stride 4/8/16/32）；
+      2) SimpleFPN（top-down + PAN bottom-up）→ P2~P5（d_model 通道）——
+         极小目标（w≈0.02-0.09 归一化）在 stride-32 上不足一个 cell，
+         是漏检的结构性根源；w≈0.02 的目标（4×9px@192）连 stride-8 都
+         不足一个 cell，必须提供 stride-4 层级；
+      3) 深度图(1ch) + 有效掩码(1ch) → DepthEncoder 轻量 CNN → stride-32
+         特征；交叉注意力在 P5（最粗尺度，与 DepthEncoder 输出对齐）注入：
          Q = P5，K=V = 深度特征，深度无效像素经 key_padding_mask 屏蔽。
+
+    对比已删除的 rgbir_resnet：Swin 原生四层多尺度（P2 不再来自被冻结的
+    ImageNet layer1，深层可随任务继续适应），22k 先验强于 ImageNet-1k，
+    窗口注意力对稠密预测更友好。
 
     pixel_values 为 dict（非 tensor）：
         rgb        (B, 3, H, W) ImageNet 归一化
@@ -355,16 +361,27 @@ class RGBIRFusionBackbone(nn.Module):
         mcfg = cfg["model"]
         d_model = int(mcfg["d_model"])
 
-        # ---- 1) RGB+IR 四通道联合 ResNet50 主干（输出 C2~C5）----
+        # ---- 1) RGB+IR 四通道联合 Swin 主干（输出 C1~C4）----
         # 子模块命名为 rgbir_backbone，train.py 依据该名称把它归入
         # backbone 参数组（使用更小的 backbone_lr 微调）。
-        self.rgbir_backbone = RGBIRResNetBackbone(
-            pretrained_path=mcfg.get("resnet_pretrained_path") or None,
-            freeze_stages=int(mcfg.get("resnet_freeze_stages", 1)),
+        # pretrained=False：只从本地 22k 权重加载，绝不触发 hub 下载
+        # （离线服务器安全）；路径缺失时 SwinModalityBackbone 内部告警
+        # 并随机初始化。
+        self.rgbir_backbone = SwinModalityBackbone(
+            variant=mcfg.get("rgbir_swin_variant",
+                             "swin_tiny_patch4_window7_224"),
+            in_chans=4,
+            pretrained=False,
+            pretrained_path=mcfg.get("rgbir_swin_pretrained_path") or None,
+            freeze_stages=int(mcfg.get("rgbir_swin_freeze_stages", 2)),
+            img_size=int(cfg["data"]["img_size"]),
+            drop_path_rate=float(mcfg.get(
+                "rgbir_swin_drop_path_rate",
+                mcfg.get("swin_drop_path_rate", 0.0))),
         )
 
-        # ---- 2) FPN：C2~C5 → P2~P5（全部 d_model 通道）----
-        # lateral 1x1 负责通道适配（ResNet 不再自带单尺度 adapter）。
+        # ---- 2) FPN：C1~C4 → P2~P5（全部 d_model 通道）----
+        # lateral 1x1 负责通道适配（96/192/384/768 → d_model）。
         self.fpn = SimpleFPN(self.rgbir_backbone.out_channels, d_model)
 
         # ---- 3) 深度分支：轻量 CNN（2ch = 深度 + 有效掩码），无预训练 ----
@@ -388,9 +405,9 @@ class RGBIRFusionBackbone(nn.Module):
 
         # 通道拼接：(B,3,H,W) + (B,1,H,W) → (B,4,H,W)
         x4 = torch.cat([rgb, ir], dim=1)
-        # 四通道联合 ResNet50 → C2~C5，FPN → P2~P5（高→低分辨率）
-        c2, c3, c4, c5 = self.rgbir_backbone(x4)
-        p2, p3, p4, p5 = self.fpn([c2, c3, c4, c5])
+        # 四通道联合 Swin-T → C1~C4，FPN → P2~P5（高→低分辨率）
+        c1, c2, c3, c4 = self.rgbir_backbone(x4)
+        p2, p3, p4, p5 = self.fpn([c1, c2, c3, c4])
         # 深度分支 → (B, d_model, H/32, W/32)，在 P5 上做交叉注意力注入
         f_depth = self.depth_encoder(depth, depth_mask)
         depth_mask_ds = DepthEncoder.downsample_mask(
@@ -549,20 +566,20 @@ def install_sdpa_attention(detr_model):
     return n
 
 
-class RGBIRResNetDETR(DetrForObjectDetection):
-    """RGB+IR 通道拼接 ResNet50 + FPN 多尺度(P2~P5) + 深度交叉注意力 + DETR。
+class RGBIRSwinDETR(DetrForObjectDetection):
+    """RGB+IR 4 通道 Swin-T(ImageNet-22k) + FPN 多尺度(P2~P5) + 深度交叉注意力 + DETR。
 
-    架构（rgbir_resnet）：
+    架构（rgbir_swin）：
       RGB(3) ─┐ 通道拼接
-      IR(1)  ─┴→ 4ch ResNet50(ImageNet) ─→ FPN → P2/P3/P4/P5 ─┐
-                                                             ├→ DETR encoder
-      Depth(1)+mask(1) → 轻量 CNN ──交叉注意力注入 P5 ─────────┘
+      IR(1)  ─┴→ 4ch Swin-T(22k) ─→ FPN → P2/P3/P4/P5 ─┐
+                                                        ├→ DETR encoder
+      Depth(1)+mask(1) → 轻量 CNN ──交叉注意力注入 P5 ────┘
 
     P2~P5（stride 4/8/16/32）各自展平为 token 拼接后送入 encoder
-    （每个尺度附加可学习的 scale embedding 以区分层级）。512 输入下
-    共 128²+64²+32²+16² = 21760 token —— 只有配合 SDPA 注意力
+    （每个尺度附加可学习的 scale embedding 以区分层级）。640 输入下
+    共 160²+80²+40²+20² = 33800 token —— 只有配合 SDPA 注意力
     （install_sdpa_attention，O(N) 显存）才能在 24GB 卡上训练；
-    eager 实现单层注意力矩阵就要 ~7.6GB。显存吃紧时可在 config 用
+    eager 实现单层注意力矩阵就要 ~26GB。显存吃紧时可在 config 用
     rgbir_encoder_scales 降级（如 [8, 16, 32] = 5376 token 或
     [16, 32] = 1280 token），被砍层级的细节仍经 PAN bottom-up 通路
     汇入保留层级。
@@ -581,17 +598,17 @@ class RGBIRResNetDETR(DetrForObjectDetection):
         self.loss_type = "ForObjectDetection"
 
         if cfg is None:
-            raise ValueError("RGBIRResNetDETR needs the run config `cfg`.")
+            raise ValueError("RGBIRSwinDETR needs the run config `cfg`.")
 
         # 我们的主干经 FPN 后输出 d_model 通道（而非 resnet50 的 2048），
         # 重建 1x1 input_projection 使通道数匹配（对每个尺度共享）。
         d_model = config.d_model
         self.model.input_projection = nn.Conv2d(d_model, d_model, kernel_size=1)
         # 换掉 conv_encoder；DetrConvModel 会为返回的每个尺度自动算 sine 位置编码
-        conv_encoder = RGBIRFusionBackbone(cfg)
+        conv_encoder = RGBIRSwinFusionBackbone(cfg)
         self.model.backbone.conv_encoder = conv_encoder
         # 送入 encoder 的 FPN 层级（高分辨率 → 低分辨率），以及区分层级的
-        # 可学习尺度嵌入。默认 P2~P5 全开（21760 token@512，需 SDPA 注意力）。
+        # 可学习尺度嵌入。默认 P2~P5 全开（33800 token@640，需 SDPA 注意力）。
         self.encoder_strides = [int(s) for s in cfg["model"].get(
             "rgbir_encoder_scales", [4, 8, 16, 32])]
         unknown = set(self.encoder_strides) - set(conv_encoder.fpn_strides)
@@ -606,8 +623,8 @@ class RGBIRResNetDETR(DetrForObjectDetection):
         install_sdpa_attention(self.model)
         # 只初始化新建的 input_projection。
         # 注意：这里绝不能调用 self.post_init()！super().__init__ 已初始化
-        # DETR 编码器/解码器/检测头，RGBIRFusionBackbone 内部也已加载
-        # 预训练 ResNet50 权重；再调一次 post_init() 会用 N(0,0.02) 递归
+        # DETR 编码器/解码器/检测头，RGBIRSwinFusionBackbone 内部也已加载
+        # 预训练 Swin-22k 权重；再调一次 post_init() 会用 N(0,0.02) 递归
         # 重置所有 Linear/Conv2d，摧毁预训练权重，导致 mAP 长期为 0。
         self.model.input_projection.apply(self._init_weights)
 
@@ -616,7 +633,6 @@ class RGBIRResNetDETR(DetrForObjectDetection):
         # 只压低前景类（12 类）偏置，EOS 类偏置保持 0 —— 若把全部 13 类
         # 都压低，softmax 会变成均匀分布（p_eos=1/13），每个 query 都以
         # "是物体"起步，匈牙利匹配剧烈震荡、CE 梯度爆炸。
-        import math
         prior_prob = 0.01
         bias_value = -math.log((1.0 - prior_prob) / prior_prob)
         with torch.no_grad():
@@ -756,7 +772,7 @@ class RGBIRResNetDETR(DetrForObjectDetection):
 
     # ----------------------------------------------------------- backbone freeze
     def freeze_backbone(self):
-        """冻结主干（4 通道 ResNet + 深度编码器），融合模块与检测头保持可训练。"""
+        """冻结主干（4 通道 Swin + 深度编码器），融合模块与检测头保持可训练。"""
         enc = self.model.backbone.conv_encoder
         for sub in (enc.rgbir_backbone, enc.depth_encoder):
             for p in sub.parameters():
@@ -787,6 +803,12 @@ class TriModalSwinFusion(nn.Module):
 
     Submodule attribute names (rgb_backbone / ir_backbone / depth_encoder)
     match train.py's backbone-vs-head parameter-group name matching.
+
+    The IR tower has two forms (`model.tri_ir_backbone`): "swin" (default,
+    1ch-adapted Swin as above) or "anythermal" (DINOv2-distilled ViT-B/14
+    thermal foundation model pseudo-tower, fully frozen except per-stage 1x1
+    projections; HCMAF feedback is discarded for it and spatial alignment is
+    handled in forward()).
     """
 
     def __init__(self, cfg):
@@ -822,12 +844,29 @@ class TriModalSwinFusion(nn.Module):
             pretrained_path=_path("tri_rgb_pretrained_path"),
             freeze_stages=int(mcfg.get("tri_freeze_stages", 2)),
             depths=_depths("tri_rgb_depths"), **common)
-        self.ir_backbone = SwinModalityBackbone(
-            variant=mcfg.get("tri_ir_variant", "swin_tiny_patch4_window7_224"),
-            in_chans=1,
-            pretrained_path=_path("tri_ir_pretrained_path"),
-            freeze_stages=ir_freeze,
-            depths=_depths("tri_ir_depths"), **common)
+        embed_dim = self.rgb_backbone.embed_dim
+        # IR 塔两种形态："swin"（默认，1ch 适配 Swin，tri_ir_* 配置生效）或
+        # "anythermal"（DINOv2 蒸馏 ViT-B/14 热红外基础模型伪塔，ViT 主体
+        # 冻结、仅训逐层 1x1 投影；z_maps 反馈被丢弃，分辨率由融合循环对齐）。
+        ir_kind = str(mcfg.get("tri_ir_backbone", "swin"))
+        if ir_kind == "anythermal":
+            self.ir_backbone = AnyThermalBackbone(
+                weights_path=_path("tri_ir_anythermal_path"),
+                embed_dim=embed_dim)
+        elif ir_kind == "swin":
+            # 容量按模态信息量分配：IR 单通道热图信息量低，等容量即过参数化；
+            # IR 默认冻 3：只训最后 stage 以抑制过拟合；
+            # 不再回退到 tri_freeze_stages（那是 RGB 的默认值，语义不同）。
+            self.ir_backbone = SwinModalityBackbone(
+                variant=mcfg.get("tri_ir_variant", "swin_tiny_patch4_window7_224"),
+                in_chans=1,
+                pretrained_path=_path("tri_ir_pretrained_path"),
+                freeze_stages=ir_freeze,
+                depths=_depths("tri_ir_depths"), **common)
+        else:
+            raise ValueError(
+                f"model.tri_ir_backbone 必须是 'swin' 或 'anythermal'，"
+                f"得到 {ir_kind!r}")
         # Depth is a geometric modality: freeze fewer stages so the 2ch-adapted
         # stem can adapt faster.
         self.depth_encoder = SwinModalityBackbone(
@@ -837,7 +876,6 @@ class TriModalSwinFusion(nn.Module):
             freeze_stages=int(mcfg.get("tri_depth_freeze_stages", 1)),
             depths=_depths("tri_depth_depths"), **common)
 
-        embed_dim = self.rgb_backbone.embed_dim
         self._branches = (self.rgb_backbone, self.ir_backbone, self.depth_encoder)
         self.fuse_stage_idx = sorted(
             int(s) - 1 for s in mcfg.get("tri_fuse_stages", [2, 3, 4]))
@@ -881,6 +919,18 @@ class TriModalSwinFusion(nn.Module):
         for i in range(4):
             maps = [bb.run_stage(i, m)
                     for bb, m in zip(self._branches, maps)]
+            # AnyThermal(ViT) 伪塔按 ceil 推导 stage 分辨率，与 Swin 塔的
+            # 窗口填充分辨率可能差 1~3 px —— 以 RGB 塔的实际形状为准对齐
+            # （Swin 塔之间形状恒一致，本检查对它们是零成本 no-op）。
+            h0, w0 = maps[0].shape[1], maps[0].shape[2]
+            if any(m.shape[1] != h0 or m.shape[2] != w0 for m in maps[1:]):
+                maps = [
+                    m if (m.shape[1] == h0 and m.shape[2] == w0)
+                    else F.interpolate(
+                        m.permute(0, 3, 1, 2), size=(h0, w0),
+                        mode="bilinear", align_corners=False
+                    ).permute(0, 2, 3, 1).contiguous()
+                    for m in maps]
             if i in self.fuse_stage_idx:
                 # Use the ACTUAL map shape: Swin stages pad odd/window-misaligned
                 # dims, so H // (4 * 2 ** i) can differ from the real resolution.
@@ -939,10 +989,9 @@ class TriModalSwinDETR(DetrForObjectDetection):
         # kept and reused in forward().
         self.model.backbone.conv_encoder = nn.Identity()
         self.model.input_projection = nn.Identity()
-        # 与 RGBIRResNetDETR 同因：P2 层 stride-4 在 640 输入下产生
-        # 160² = 25600 token，四层合计 262400 token。eager 注意力
-        # attention 矩阵 262400² × 2B ≈ 137 GB，24GB 卡必爆。
-        # 换成数学等价的 SDPA 实现（flash attention，O(N·d) 激活）。
+        # 与 rgbir_swin 同因：P2 层 stride-4 在 640 输入下产生 160² token，
+        # 四层合计 33800 token。eager 注意力矩阵 12×33800²×2B ≈ 26 GB，
+        # 24GB 卡必爆。换成数学等价的 SDPA 实现（O(N) 激活显存）。
         install_sdpa_attention(self.model)
         # No post_init(): see MultiModalSwinDETR for why a second init would
         # destroy pretrained backbone weights.
@@ -1081,6 +1130,9 @@ class TriModalSwinDETR(DetrForObjectDetection):
                     self.tri_backbone.depth_encoder):
             for p in sub.parameters():
                 p.requires_grad = True
+        # AnyThermal ViT 主体是冻结的基础模型，解冻其余参数后恢复冻结
+        if hasattr(self.tri_backbone.ir_backbone, "freeze_foundation"):
+            self.tri_backbone.ir_backbone.freeze_foundation()
 
 
 def build_detr_config(cfg):
@@ -1215,20 +1267,20 @@ def build_model(cfg):
 
     COCO DETR 头热启动统一放在分发之后：encoder/decoder/bbox_predictor/
     query_position 的权重形状与 token 数量、与 backbone 完全无关，
-    rgbir_resnet 与 tri_swin 共用同一套先验。
+    rgbir_swin 与 tri_swin 共用同一套先验。
     cssa_detr 保留旧行为（不热启动）。
     """
     config = build_detr_config(cfg)
     arch = cfg["model"].get("arch", "cssa_detr")
-    if arch == "rgbir_resnet":
-        model = RGBIRResNetDETR(config, cfg=cfg)
+    if arch == "rgbir_swin":
+        model = RGBIRSwinDETR(config, cfg=cfg)
     elif arch == "tri_swin":
         model = TriModalSwinDETR(config, cfg=cfg)
     elif arch == "cssa_detr":
         return MultiModalSwinDETR(config, cfg=cfg)
     else:
         raise ValueError(f"Unknown model.arch: {arch!r} "
-                         "(expected 'rgbir_resnet', 'tri_swin' or 'cssa_detr')")
+                         "(expected 'rgbir_swin', 'tri_swin' or 'cssa_detr')")
 
     warm = cfg["model"].get("detr_warm_start")
     if warm:
