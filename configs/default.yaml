@@ -14,8 +14,7 @@ data:
 # ---- Model ----
 model:
   # 架构开关：rgbir_swin = RGB+IR 4通道拼接 Swin-T(22k) + 深度交叉注意力（默认）；
-  #          tri_swin = TMSC-Det（三塔 + HCMAF + FPN，IR 塔可切 AnyThermal）；
-  #          cssa_detr = 旧结构（Swin-S + CSSA 融合，仅保留参考）
+  #          tri_swin = TMSC-Det（三塔 + HCMAF + FPN，IR 塔可切 AnyThermal）
   arch: "rgbir_swin"
 
   # ---- rgbir_swin：4 通道 Swin 早期融合（替代已删除的 rgbir_resnet）----
@@ -26,9 +25,14 @@ model:
   rgbir_swin_variant: "swin_tiny_patch4_window7_224"
   rgbir_swin_pretrained_path: "weights/swin_tiny_patch4_window7_224_22k.pth"
   rgbir_swin_freeze_stages: 2          # 冻结前 2 stage
-  # 深度交叉注意力（P5 注入），tri_swin/cssa_detr 分支共用这两个键
+  # 深度交叉注意力（P5 注入），rgbir_swin/tri_swin 分支共用这两个键
   depth_fuse_heads: 8
   depth_fuse_dropout: 0.0              # 0 = train/eval 前向完全一致（小数据集更稳）
+  # 深度输入编码方式：
+  #   linear = 1 通道线性 /20000 + mask（旧行为，默认，向后兼容）
+  #   geo3   = 3 通道 [log | inverse | valid] 几何编码（需重训，旧 ckpt 不兼容）
+  depth_encoding: "linear"
+
   # FPN（P2~P5, stride 4/8/16/32）中送入 DETR encoder 的层级。
   # 实验证据：单尺度 stride-32 时训练集 cardinality error 长期 ≈4.5 压不下去
   # ——极小目标在 stride-32 上不足一个 cell，是漏检的结构性根源；
@@ -83,20 +87,6 @@ model:
   # 显存吃紧可降级：[8,16,32]=5376 token，[16,32]=1280 token
   tri_encoder_scales: [4, 8, 16, 32]
 
-  # ---- cssa_detr（旧结构，仅保留参考）----
-  # RGB backbone (Swin Transformer, ImageNet-22k pretrained)
-  swin_variant: "swin_small_patch4_window7_224"   # timm name (new timm dropped the _22k suffix; ImageNet-22k weights come via pretrained=True / pretrained_path)
-  swin_out_stage: 3                                   # 取 stage3 (stride 32)
-  swin_freeze_stages: 2                               # 前 2 stage 冻结
-  swin_drop_path_rate: 0.0                            # 0 = 关闭 DropPath，保证 train/eval 前向一致（小数据集更稳）
-  swin_pretrained: true                              # 训练时从 timm hub 拉权重（构造时默认关闭以免联网）
-  swin_pretrained_tag: "ms_in22k"                     # timm tag → ImageNet-22k 权重
-  swin_pretrained_path: "./weights/swin_small_patch4_window7_224_22k.pth"  # 离线权重；存在则优先用，不存在则走 hub
-
-  # IR backbone（cssa_detr 用）
-  ir_backbone: "resnet50_imagenet_1ch"                 # fallback；"anythermal" 切换到 AnyThermal
-  ir_pretrained_path: "./weights/resnet50-11ad3fa6.pth"  # resnet50_v2 本地权重（离线用）；anythermal 时指向其权重
-
   # DETR head
   num_labels: 12
   num_queries: 100
@@ -110,10 +100,6 @@ model:
   detr_dropout: 0.1
   detr_attention_dropout: 0.1
   detr_activation_dropout: 0.0
-
-  # Fusion（cssa_detr 用）
-  cssa_tau: 0.5                 # 通道切换阈值，固定不学
-  cssa_reduction: 16             # 通道评分 1D conv reduction
 
 # 12-class label map
 id2label:

@@ -223,7 +223,7 @@ def main():
     # differently by mode (BatchNorm/Dropout/DropPath). Hook the fused
     # backbone feature to see whether collapse starts in the backbone.
     captured = {}
-    arch = cfg["model"].get("arch", "cssa_detr")
+    arch = cfg["model"].get("arch", "rgbir_swin")
 
     if arch == "tri_swin":
         # tri_swin: conv_encoder is a never-called nn.Identity(); hook the
@@ -235,9 +235,10 @@ def main():
 
         handle = model.tri_backbone.register_forward_hook(_hook)
     else:
+        # rgbir_swin: RGBIRSwinFusionBackbone returns [(p2, m), ..., (p5, m)];
+        # capture the last (coarsest) pyramid level.
         def _hook(module, inp, outp):
-            # MultiModalBackbone returns [(f_enh, mask)]
-            captured["f"] = outp[0][0].detach()
+            captured["f"] = outp[-1][0].detach()
 
         handle = model.model.backbone.conv_encoder.register_forward_hook(_hook)
 

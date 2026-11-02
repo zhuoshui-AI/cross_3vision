@@ -7,45 +7,43 @@ ball, light, garbage_can, uav, tricycle).
 
 ## Architecture
 
-```
-RGB ─► Swin-S (ImageNet-22k) ─► F_rgb (768ch, /32)
-                                    │
-IR  ─► ResNet50-1ch (ImageNet, conv1 summed) ─► F_ir (768ch, /32)
-                                    │
-                       CSSA Fusion (channel-switching + spatial attn)
-                                    │  ◄── front-half: RGB↔IR info exchange
-                              F_fused (256ch, /32)
-                                    │
-Depth ─► DepthEncoder (depth+mask CNN) ─► F_depth (256ch, /32)
-                                    │
-                       Depth Late Fusion (cross-attn: Q=fused, K=V=depth)
-                                    │  ◄── back-half: depth injection
-                              F_enh (256ch, /32)
-                                    │
-                       DETR encoder + decoder + heads (reused from HF)
-                                    │
-                            logits (100×13) + pred_boxes (100×4 cxcywh)
-```
+Two architectures, selected by `model.arch`:
 
-- **RGB branch**: `swin_small_patch4_window7_224` with ImageNet-22k weights
-  (`timm` tag `ms_in22k`). First 2 stages frozen. Outputs stride-32 features
-  at 768 channels.
-- **IR branch**: ImageNet ResNet50-V2 with `conv1` adapted to 1-channel by
-  summing weights across the original 3 input channels (equivalent to feeding
-  the IR grayscale through all 3 RGB weights). A 1×1 adapter projects layer4
-  (2048-dim) to the Swin dim (768). AnyThermal swap-in is stubbed.
-- **CSSA Fusion** (Cao et al., CVPRW 2023): per-modality SE channel scorers
-  switch low-scoring channels between RGB and IR (threshold τ=0.5), a CBAM
-  spatial gate blends the switched streams, and a 1×1 conv projects to d_model.
-- **Depth branch**: lightweight 5-stride-2 CNN, 2-channel input (depth + mask),
-  no pretraining (depth is geometric). `DepthEncoder.downsample_mask` produces
-  the cross-attn key_padding_mask.
-- **Depth Late Fusion**: single cross-attention layer; fused RGB+IR = queries,
-  depth = keys/values; the depth validity mask gates attention.
-- **DETR head**: `DetrForObjectDetection` (100 queries, d_model=256, 6+6
-  encoder/decoder layers, auxiliary losses). Hungarian matcher + CE/L1/GIoU
-  losses are reused verbatim — `MultiModalSwinDETR` only replaces the
-  conv-encoder and overrides `forward` to feed a dict of per-modality tensors.
+### rgbir_swin (default)
+
+RGB + IR early-concat (4 channels) flow through a single ImageNet-22k Swin-T
+tower, producing multi-scale C1~C4 features. A SimpleFPN (top-down + PAN
+bottom-up) builds P2~P5 at `d_model` channels. A lightweight depth CNN
+produces stride-32 depth features injected into P5 via a single
+cross-attention layer (Q = fused RGB+IR, K=V = depth). Selected FPN levels
+(default P2~P5) are flattened into tokens and fed to the DETR encoder.
+
+### tri_swin (TMSC-Det)
+
+Three per-modality Swin towers (RGB / IR / Depth), each capacity-tuned to its
+modality's information content. Per-scale HCMAF (Hierarchical Cross-Modal
+Attention Fusion) blocks jointly attend over all modalities at each stage and
+feed refined features back into each tower's next stage. The fused stage
+outputs go through SimpleFPN → P2~P5 and on to the DETR encoder. The IR tower
+can swap to AnyThermal (DINOv2-distilled ViT-B/14).
+
+Common to both:
+- **RGB+IR backbone**: `swin_tiny_patch4_window7_224` (ImageNet-22k). For
+  rgbir_swin the patch_embed is adapted to 4 channels (channels 0-2 keep RGB
+  weights, channel 3 = mean of the 3). First 2 stages frozen.
+- **Depth branch**: lightweight 5-stride-2 CNN, 2-channel input
+  (depth + validity mask), no pretraining (depth is geometric).
+- **Depth late fusion**: single cross-attention layer (Q = fused RGB+IR,
+  K=V = depth). Zero-initialized so it starts as identity and depth is
+  injected gradually (avoids query collapse).
+- **DETR head**: `DetrForObjectDetection` (100 queries, d_model=256,
+  6+6 encoder/decoder layers, auxiliary losses). Hungarian matcher +
+  CE/L1/GIoU losses are reused verbatim; only the conv-encoder is replaced
+  and `forward` overridden to accept a dict of per-modality tensors.
+- **COCO warm-start**: encoder / decoder / bbox_predictor / query_position
+  inherited from `facebook/detr-resnet-50` (small-data convergence recipe).
+- **SDPA attention**: O(N) memory, lets P2-level (~33k-token) training fit on
+  24 GB GPUs.
 
 ## File layout
 
@@ -59,9 +57,9 @@ lab/
 ├─ src/
 │  ├─ __init__.py
 │  ├─ data.py                  # MultiModalDataset + collate_fn (cxcywh labels)
-│  ├─ backbones.py             # SwinRGBBackbone / IRBackbone / DepthEncoder
-│  ├─ fusion.py                # CSSAFusion (front) + DepthLateFusion (back)
-│  ├─ model.py                 # MultiModalBackbone + MultiModalSwinDETR + build_model
+│  ├─ backbones.py             # SwinModalityBackbone / DepthEncoder / AnyThermalBackbone
+│  ├─ fusion.py                # DepthLateFusion + HCMAFBlock + SimpleFPN
+│  ├─ model.py                 # RGBIRSwinDETR + TriModalSwinDETR + build_model
 │  ├─ losses.py                # build_detr_config re-export + box converters
 │  ├─ eval.py                  # torchmetrics mAP@50-95
 │  ├─ inference.py             # write per-stem `<stem>.txt` per spec
@@ -129,8 +127,9 @@ detections survive.
   for `data.img_size` (512). Feed other sizes only if you rebuild the model
   (the `patch_embed.strict_img_size=False` flag tolerates input sizes divisible
   by the patch size, but the mask mismatch still requires a fixed size).
-- **AnyThermal**: stubbed via `_AnyThermalAdapter` (raises cleanly). Switch
-  `model.ir_backbone` to `"anythermal"` and provide weights to enable.
+- **AnyThermal** (tri_swin IR tower): switch `model.tri_ir_backbone` to
+  `"anythermal"` and provide weights (`scripts/download_pretrained.sh
+  WITH_ANYTHERMAL=1`) to enable the DINOv2-distilled ViT-B/14 thermal backbone.
 - **Label format**: spec labels are `[cls, cx, cy, w, h]`; the dataset converts
   to cxcywh normalized for DETR. Inference output is also cxcywh (native DETR
   `pred_boxes`), so no re-conversion is needed on the spec side.

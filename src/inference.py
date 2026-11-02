@@ -53,6 +53,7 @@ def run_inference(cfg, ckpt_path=None, device=None):
         img_size=int(cfg["data"]["img_size"]), train=False,
         num_classes=int(cfg["model"]["num_labels"]),
         scan_source="images",  # test sets have no labels/: enumerate visible/
+        depth_encoding=cfg["model"].get("depth_encoding", "linear"),
     )
     loader = DataLoader(
         ds, batch_size=1, shuffle=False,

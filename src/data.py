@@ -107,11 +107,15 @@ class MultiModalDataset(Dataset):
 
     def __init__(self, data_root, split_file=None, ids=None,
                  img_size=512, train=True, num_classes=12,
-                 scan_source="labels"):
+                 scan_source="labels", depth_encoding="linear"):
         self.data_root = data_root
         self.img_size = img_size
         self.train = train
         self.num_classes = num_classes
+        if depth_encoding not in ("linear", "geo3"):
+            raise ValueError(
+                f"depth_encoding 必须是 'linear' 或 'geo3'，得到 {depth_encoding!r}")
+        self.depth_encoding = depth_encoding
 
         self.rgb_dir = os.path.join(data_root, "visible")
         self.ir_dir = os.path.join(data_root, "infrared")
@@ -261,6 +265,15 @@ class MultiModalDataset(Dataset):
         if 0.0 < invalid_frac <= 0.5:  # 全无效样本跳过（mask 已兜底）
             filled = self._fill_depth_holes(depth[..., 0], depth_invalid)
             depth = filled[..., None]
+        # ---- 训练期 raw 域深度增强（编码前、几何变换前）----
+        # 噪声/脱落必须在 raw 值域上模拟：若放在 _normalize_depth 之后，
+        # geo3 的 valid 通道会被噪声破坏 0/1 语义，对 log 域加噪也不等价于
+        # 对物理距离加噪。脱落的 raw 值保持原样（掩码兜底，编码后该区域
+        # 置零）——先置 0 会被 resize 线性插值拖进有效区边缘形成假梯度，
+        # 与 _fill_depth_holes 要防的问题同源。
+        if self.train:
+            depth, depth_invalid = self._augment_depth_train_raw(
+                depth, depth_invalid, depth_is_mm)
         # validity mask（255=有效）作为 mask 类型的 additional_target，
         # 与深度图共享几何变换（最近邻插值，不做平滑）
         depth_valid_u8 = (~depth_invalid).astype(np.uint8) * 255
@@ -330,11 +343,8 @@ class MultiModalDataset(Dataset):
         pixel_rgb = self._normalize_rgb(rgb_t)
         pixel_ir = self._normalize_ir(ir_t)
         pixel_depth, depth_mask = self._normalize_depth(
-            depth_t, depth_is_mm, depth_valid)
-        # 深度传感器噪声/脱落模拟（仅训练期）
-        if self.train:
-            pixel_depth, depth_mask = self._augment_depth_train(
-                pixel_depth, depth_mask)
+            depth_t, depth_is_mm, depth_valid,
+            encoding=self.depth_encoding)
 
         target = {
             "class_labels": torch.from_numpy(labels_aug).long(),
@@ -439,49 +449,96 @@ class MultiModalDataset(Dataset):
             ).astype(np.uint8)
         return c[..., None]
 
-    @staticmethod
-    def _augment_depth_train(depth_chw, valid_mask):
-        """训练期深度传感器噪声/脱落模拟（归一化后施加）。
+    def _augment_depth_train_raw(self, depth_hwc, invalid, is_mm):
+        """训练期深度传感器噪声/脱落模拟（raw 值域，编码前施加）。
 
-        1) 高斯噪声：仅在有效像素上，σ 取量程的 0.1%~0.4%（≈20~80mm），
-           模拟深度传感器的测量抖动；
-        2) 随机脱落：2~5 个小矩形区域整体置无效，模拟传感器空洞/反光
+        1) 高斯噪声：仅在有效像素上，16bit σ=20~80mm（量程 0.1%~0.4%），
+           模拟深度传感器的测量抖动；clamp 到 [10,20000] 保持有效性
+           （<10mm 是无效哨兵，不能被噪声造出来）。8bit 路径无 mm 语义，
+           σ 等比换算到 [0.26, 1.02] 灰度级，clamp [1,255] 保持 >0 有效。
+        2) 随机脱落：2~5 个小矩形区域直接置 invalid，模拟传感器空洞/反光
            失效——推理时的深度图经常出现这类缺失，训练期见过才能鲁棒。
+           raw 值保持原样：掩码兜底（编码后置零），先置 0 会被 resize 线性
+           插值拖进有效区边缘形成假梯度（与空洞填充防的问题同源）。
         """
-        if torch.rand(()) < 0.30:
-            sigma = float(torch.empty(1).uniform_(0.001, 0.004))
-            noisy = (depth_chw + torch.randn_like(depth_chw) * sigma
-                     ).clamp(0.0, 1.0)
-            depth_chw = torch.where(valid_mask, noisy, depth_chw)
-        if torch.rand(()) < 0.20:
-            _, H, W = depth_chw.shape
-            n_holes = int(torch.randint(2, 6, ()))
+        d = depth_hwc[..., 0]
+        valid = ~invalid
+        if valid.any() and np.random.rand() < self._p_depth_noise:
+            if is_mm:
+                sigma = float(np.random.uniform(20.0, 80.0))
+                lo, hi = 10.0, 20000.0
+            else:
+                sigma = float(np.random.uniform(0.26, 1.02))
+                lo, hi = 1.0, 255.0
+            noise = np.random.normal(0.0, sigma, d.shape).astype(np.float32)
+            noisy = np.clip(d + noise, lo, hi)
+            d = np.where(valid, noisy, d).astype(np.float32)
+        if np.random.rand() < self._p_depth_dropout:
+            H, W = d.shape
+            n_holes = int(np.random.randint(2, 6))
             for _ in range(n_holes):
-                rw = int(torch.randint(max(2, W // 50), max(3, W // 12) + 1, ()))
-                rh = int(torch.randint(max(2, H // 50), max(3, H // 12) + 1, ()))
-                x0 = int(torch.randint(0, max(1, W - rw), ()))
-                y0 = int(torch.randint(0, max(1, H - rh), ()))
-                valid_mask[y0:y0 + rh, x0:x0 + rw] = False
-                depth_chw[:, y0:y0 + rh, x0:x0 + rw] = 0.0
-        return depth_chw, valid_mask
+                rw = int(np.random.randint(max(2, W // 50), max(3, W // 12) + 1))
+                rh = int(np.random.randint(max(2, H // 50), max(3, H // 12) + 1))
+                x0 = int(np.random.randint(0, max(1, W - rw)))
+                y0 = int(np.random.randint(0, max(1, H - rh)))
+                invalid[y0:y0 + rh, x0:x0 + rw] = True
+        return d[..., None], invalid
 
     @staticmethod
-    def _normalize_depth(depth_hwc, is_mm=True, valid=None):
-        """Normalize depth to [0,1]; invalid pixels zeroed.
+    def _normalize_depth(depth_hwc, is_mm=True, valid=None, encoding="linear"):
+        """Normalize depth; invalid pixels zeroed. Two encodings:
+
+        linear（默认，旧行为）: (1, H, W) float in [0,1] = depth_mm / 20000，
+          近场只占值域前一小段，但与旧 checkpoint 兼容。
+        geo3: (3, H, W) = [log1p(d)/log1p(max) | (max-d)/max | valid]，
+          log 压缩远距动态范围保留远景结构，inverse 近场线性增强
+          （必须用 (max-d)/max 线性形式——1/z 值域 0~2e-4，uint8 量化后
+          全部截断为 0，v4 已验证踩坑），valid 显式带入编码器。
+          输出 float32（不做 uint8 量化）。
 
         Two input formats coexist in this dataset:
           - 16-bit mm PNG (is_mm=True):  range [0, 19999] mm, invalid if <10 or >20000.
           - 8-bit pre-normalized JPG (is_mm=False): range [0, 255], no mm
             semantics; treat 0 as invalid but keep the rest.
+            geo3 下按 v4 的做法映射到 mm 域（* 20000/255），两条路径共用公式。
         valid: 变换后的 (H, W) bool 掩码（与深度图共享几何变换）；
                为 None 时按值域推断（兼容旧调用方式）。
-        Both produce a (1, H, W) float tensor in ~[0,1] and a (H, W) bool mask.
+        Both return (tensor, mask); mask is always a (H, W) bool.
         """
+        if encoding == "geo3":
+            DEPTH_MAX_MM = 20000.0
+            d2d = depth_hwc[..., 0].astype(np.float32)
+            if is_mm:
+                d = np.clip(d2d, 0.0, DEPTH_MAX_MM)
+            else:
+                # 8bit 路径同样 clip：越界值映射到 >20000mm 会把 log 通道
+                # 推过 1.0、inverse 通道压成负数，破坏 [0,1] 输出契约。
+                d = np.clip(d2d, 0.0, 255.0) * (DEPTH_MAX_MM / 255.0)
+            if valid is None:
+                if is_mm:
+                    valid = (d2d >= 10.0) & (d2d <= 20000.0)
+                else:
+                    valid = d2d > 0.0
+            valid_f = valid.astype(np.float32)
+            # c0: log 压缩（远距结构）；c1: 近场线性增强（不能用 1/z）；
+            # c2: 有效掩码。无效像素三通道全零。
+            logc = np.log1p(d) / np.log1p(DEPTH_MAX_MM)
+            inv = np.where(valid, (DEPTH_MAX_MM - d) / DEPTH_MAX_MM, 0.0)
+            geo = np.stack([logc, inv, valid_f], axis=2)
+            geo[~valid] = 0.0
+            tensor = torch.from_numpy(
+                np.ascontiguousarray(geo.transpose(2, 0, 1))).float()
+            mask = torch.from_numpy(np.ascontiguousarray(valid)).bool()
+            return tensor, mask
+
+        # ---- linear（旧行为，逐元素不变）----
         x = depth_hwc.astype(np.float32)
         if is_mm:
             x = np.clip(x, 0.0, 20000.0) / 20000.0
         else:
-            x = x / 255.0
+            # 与 mm 路径同款防御：8bit 正常值天然在 [0,255]，clip 为恒等；
+            # 损坏/越界值不至于把输出推出 [0,1] 契约。
+            x = np.clip(x, 0.0, 255.0) / 255.0
         if valid is None:
             if is_mm:
                 valid = (depth_hwc[..., 0] >= 10.0) & (depth_hwc[..., 0] <= 20000.0)

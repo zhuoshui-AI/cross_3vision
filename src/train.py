@@ -3,7 +3,7 @@ two-param-group AdamW (backbone vs. head), periodic val + best-ckpt save.
 
 We bypass HF Trainer for explicit control over the multi-modal batch dict
 (per-modality tensors + depth_mask). Loss / matcher / auxiliary losses are
-reused from HF via MultiModalSwinDETR.loss_function (ForObjectDetectionLoss).
+reused from HF via the DETR model's loss_function (ForObjectDetectionLoss).
 """
 import argparse
 import json
@@ -50,18 +50,18 @@ def _move_batch(batch, device):
 def build_optimizer(model, cfg):
     """AdamW with two param groups: backbones at backbone_lr, rest at lr.
 
-    Works for both architectures: cssa_detr params live under
-    `conv_encoder.{rgb_backbone,ir_backbone,depth_encoder}`, tri_swin params
-    under `tri_backbone.{rgb_backbone,ir_backbone,depth_encoder}` — the
-    substring matching below covers both.
+    rgbir_swin params live under `conv_encoder.rgbir_backbone` (4ch Swin) /
+    `conv_encoder.depth_encoder`, tri_swin params under
+    `tri_backbone.{rgb_backbone,ir_backbone,depth_encoder}` — the substring
+    matching below covers both.
     """
     tcfg = cfg["train"]
     backbone_params, head_params = [], []
     for n, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        # Anything under our MultiModalBackbone's rgb/ir/depth sub-backbones
-        # gets the backbone learning rate; fusion + DETR heads get the head lr.
+        # Anything under the per-modality sub-backbones gets the backbone
+        # learning rate; fusion + DETR heads get the head lr.
         # rgbir_swin 架构的 4 通道 Swin 主干命名为 rgbir_backbone，同样归入
         # backbone 参数组（微调 lr）。
         is_backbone = any(s in n for s in (
@@ -192,20 +192,24 @@ def train(cfg, resume=None, restart=None):
     use_separate_val = (val_root is not None
                         and val_split is not None
                         and os.path.abspath(val_root) != os.path.abspath(train_root))
+    depth_enc = cfg["model"].get("depth_encoding", "linear")
 
     if use_separate_val:
         train_ds = MultiModalDataset(
             data_root=train_root, split_file=train_split,
-            img_size=img_size, train=True, num_classes=ncls)
+            img_size=img_size, train=True, num_classes=ncls,
+            depth_encoding=depth_enc)
         val_ds = MultiModalDataset(
             data_root=val_root, split_file=val_split,
-            img_size=img_size, train=False, num_classes=ncls)
+            img_size=img_size, train=False, num_classes=ncls,
+            depth_encoding=depth_enc)
         log.info(f"Val set: independent dir {val_root} ({len(val_ds)} imgs)")
     else:
         # Get the full ID list once, then split by val_ratio.
         full_ds = MultiModalDataset(
             data_root=train_root, split_file=train_split,
-            img_size=img_size, train=True, num_classes=ncls)
+            img_size=img_size, train=True, num_classes=ncls,
+            depth_encoding=depth_enc)
         n_total = len(full_ds)
         val_ratio = float(cfg["data"].get("val_ratio", 0.1))
         n_val = max(1, int(round(n_total * val_ratio)))
@@ -216,10 +220,12 @@ def train(cfg, resume=None, restart=None):
         val_ids = [full_ds.ids[i] for i in perm[n_train:]]
         train_ds = MultiModalDataset(
             data_root=train_root, ids=train_ids,
-            img_size=img_size, train=True, num_classes=ncls)
+            img_size=img_size, train=True, num_classes=ncls,
+            depth_encoding=depth_enc)
         val_ds = MultiModalDataset(
             data_root=train_root, ids=val_ids,
-            img_size=img_size, train=False, num_classes=ncls)
+            img_size=img_size, train=False, num_classes=ncls,
+            depth_encoding=depth_enc)
         log.info(f"Split train set {train_root}: {n_train} train / {n_val} val "
                  f"(val_ratio={val_ratio})")
 
