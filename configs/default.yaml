@@ -134,6 +134,15 @@ train:
   log_dir: "./outputs/logs"
   ckpt_dir: "./outputs/ckpt"
   val_interval: 5
+  # iter 级训练日志的打印间隔（默认关闭，每 epoch 只打一行汇总）：
+  #   log_interval: 0 = 关闭 iter 打印（默认，控制台每 epoch 一行：
+  #                    train_loss / test_loss / 两组 lr + 验证时的 mAP）
+  #   "auto"          = 自动动态：每 epoch 约 log_lines_per_epoch 行，
+  #                     间隔 = ceil(iters_per_epoch / 行数)，iters/epoch =
+  #                     样本数/batch_size，随 batch 与数据规模自动伸缩
+  #   数字 N          = 固定间隔（it % N == 0 打印，it=0 必打印）
+  log_interval: 0
+  log_lines_per_epoch: 10
   # ---- 早停（监控验证 mAP@50-95）----
   # early_stop_patience: 连续 N 次验证（每 val_interval 个 epoch 一次）无显著
   #                      提升则停训；0 = 关闭

@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import torch
+import yaml
 from torch.utils.data import DataLoader
 
 # 兼容两种运行方式：
@@ -155,6 +156,13 @@ def train(cfg, resume=None, restart=None):
         log.info(f"  DETR warm start       : {cfg['model']['detr_warm_start']}")
     log.info("=" * 60)
 
+    # ---- 完整有效配置写入日志（--set / --data-root 覆盖后的最终值）----
+    # 便于事后从日志完整复现本次训练的全部超参（含 CLI 覆盖项）。
+    log.info("Effective config (含 CLI --set / --data-root 覆盖):")
+    log.info(yaml.safe_dump(cfg, allow_unicode=True, sort_keys=False,
+                            default_flow_style=False).rstrip())
+    log.info("=" * 60)
+
     img_size = int(cfg["data"]["img_size"])
     ncls = int(cfg["model"]["num_labels"])
 
@@ -277,6 +285,23 @@ def train(cfg, resume=None, restart=None):
     os.makedirs(ckpt_dir, exist_ok=True)
     val_interval = int(tcfg["val_interval"])
     grad_clip = float(tcfg["grad_clip"])
+    # ---- iter 级日志间隔（防大 epoch 刷屏 / 小 epoch 不欠打）----
+    #   "auto" = ceil(iters/epoch ÷ log_lines_per_epoch)，每 epoch 固定约 N
+    #            行；iters/epoch = 样本数/batch_size，随 batch 与数据规模
+    #            自动伸缩（batch 越大/数据越小 → 间隔越小）
+    #   数字 N = 固定间隔；0 = 关闭。epoch 级汇总不受此影响。
+    n_iters_per_epoch = len(train_loader)
+    li_cfg = tcfg.get("log_interval", "auto")
+    lines_per_epoch = int(tcfg.get("log_lines_per_epoch", 10))
+    if isinstance(li_cfg, str) and li_cfg.lower() == "auto":
+        log_interval = max(
+            1, math.ceil(n_iters_per_epoch / max(1, lines_per_epoch)))
+        li_desc = (f"auto (interval={log_interval}, {n_iters_per_epoch} "
+                   f"iters/epoch ÷ {lines_per_epoch} lines)")
+    else:
+        log_interval = max(0, int(li_cfg))
+        li_desc = f"fixed (interval={log_interval or 'off'})"
+    log.info(f"Log: iter {li_desc}, val every {val_interval} epochs")
 
     # ---- 早停（以验证 mAP@50-95 为监控指标）----
     es_patience = int(tcfg.get("early_stop_patience", 0))
@@ -328,11 +353,10 @@ def train(cfg, resume=None, restart=None):
                 for k, v in out.loss_dict.items():
                     train_sums[k] = train_sums.get(k, 0.0) + float(v.item())
                 train_n += 1
-            if it % 50 == 0:
+            if log_interval > 0 and (it == 0 or it % log_interval == 0):
                 log.info(f"ep{epoch} it{it}/{len(train_loader)} "
                          f"loss={loss.item()*accum:.4f} "
                          f"lr={scheduler.get_last_lr()[0]:.2e}")
-        log.info(f"Epoch {epoch} mean loss = {running/len(train_loader):.4f}")
 
         # ---- 组装本 epoch 的 JSONL 记录 ----
         train_means = {k: v / max(1, train_n) for k, v in train_sums.items()}
@@ -359,6 +383,14 @@ def train(cfg, resume=None, restart=None):
             v * float(loss_weights.get(re.sub(r"_\d+$", "", k), 1.0))
             for k, v in val_means.items()
             if re.sub(r"_\d+$", "", k) in loss_keys)
+
+        # ---- epoch 汇总（控制台唯一一行：trend 一眼可读）----
+        # 两组 lr 都打：LambdaLR 为每个参数组各返回一个值，[0]=head 组，
+        # [-1]=backbone 组（各乘同一个 lambda，量级差 = lr/backbone_lr）。
+        lrs = scheduler.get_last_lr()
+        log.info(f"Epoch {epoch} train_loss={running/max(1, n_batches):.4f} "
+                 f"test_loss={stats['test_loss']:.4f} "
+                 f"lr(head/backbone)={lrs[0]:.2e}/{lrs[-1]:.2e}")
 
         if do_val:
             # Evaluate (and save best) with EMA weights when EMA is on: the
