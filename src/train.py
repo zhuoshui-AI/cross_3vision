@@ -373,13 +373,16 @@ def train(cfg, resume=None, restart=None):
     log.info(f"Log: iter {li_desc}, val every {val_interval} epochs")
 
     # ---- 早停（以验证 mAP@50-95 为监控指标）----
+    # 触发条件：连续 patience 次验证，mAP@50-95 的提升都 < min_delta
+    # 前 warmup_epochs 个 epoch 不计数，让模型有充分时间爬升
     es_patience = int(tcfg.get("early_stop_patience", 0))
     es_min_delta = float(tcfg.get("early_stop_min_delta", 0.0))
-    es_bad_evals = 0          # 连续无提升的验证次数
+    es_warmup = int(tcfg.get("early_stop_warmup_epochs", 0))
+    es_bad_evals = 0          # 连续无实质提升的验证次数
     early_stop = False
     if es_patience > 0:
         log.info(f"Early stopping ON : patience={es_patience} 次验证, "
-                 f"min_delta={es_min_delta}")
+                 f"min_delta={es_min_delta}, warmup={es_warmup} epochs")
 
     # ---- DETR 风格 per-epoch JSONL 日志（对齐 facebook/detr 的 log.txt）----
     # 与文本日志共用同一 run_id 时间戳 → 每次训练一对独立文件，互不混淆
@@ -492,19 +495,24 @@ def train(cfg, resume=None, restart=None):
             stats["test_coco_eval_bbox"] = [
                 float(x) if x is not None else None for x in coco12]
             prev_best = best
-            if score == score and score > best:  # not NaN & improved
+            if score == score and score > best:  # not NaN & new record
                 best = score
                 save_ckpt(os.path.join(ckpt_dir, "best.pth"),
                           model, optimizer, scheduler, epoch, best, cfg)
                 log.info(f"  ↑ new best {best:.4f} → best.pth")
-            # ---- 早停计数：提升幅度 ≤ min_delta 视为无提升 ----
+            # ---- 早停计数：只有过了 warmup 才开始算 ----
             if es_patience > 0:
-                if score == score and score > prev_best + es_min_delta:
+                if epoch < es_warmup:
+                    pass  # warmup 期：无论升降都不计数
+                elif score == score and score > prev_best + es_min_delta:
+                    # 实质提升 → 清零
                     es_bad_evals = 0
                 else:
+                    # 持平、波动或下降 → 计数 +1
                     es_bad_evals += 1
+                    gap = (score - best) if score == score else float("nan")
                     log.info(f"  early-stop: {es_bad_evals}/{es_patience} "
-                             f"次验证无显著提升")
+                             f"（gap={gap:.4f} vs best={best:.4f}）")
                 if es_bad_evals >= es_patience:
                     early_stop = True
         if ema is not None:

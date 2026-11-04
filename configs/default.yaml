@@ -153,11 +153,15 @@ train:
   log_interval: 0
   log_lines_per_epoch: 10
   # ---- 早停（监控验证 mAP@50-95）----
-  # early_stop_patience: 连续 N 次验证（每 val_interval 个 epoch 一次）无显著
-  #                      提升则停训；0 = 关闭
-  # early_stop_min_delta: 提升幅度超过该值才算"显著提升"
-  early_stop_patience: 10
-  early_stop_min_delta: 0.0
+  # 触发条件：连续 patience 次验证（每 val_interval 个 epoch 一次），
+  # mAP@50-95 提升都 < min_delta → 视为进入平台期，自动停训
+  # early_stop_patience: 连续 N 次"无实质提升"的验证（0 = 关闭早停）
+  # early_stop_min_delta: 提升幅度超过该值才算"实质提升"，
+  #                      用于过滤验证集随机波动（val 200 张图波动 ~±0.005）
+  # early_stop_warmup_epochs: 前 N 个 epoch 早停不工作，让模型充分爬升
+  early_stop_patience: 6
+  early_stop_min_delta: 0.005
+  early_stop_warmup_epochs: 30
 
 # Loss weights (DETR 默认)
 loss:
