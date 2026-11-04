@@ -13,8 +13,10 @@ import re
 import subprocess
 import sys
 import time
+from collections import Counter
 from pathlib import Path
 
+import numpy as np
 import torch
 import yaml
 from torch.utils.data import DataLoader
@@ -185,6 +187,71 @@ def train(cfg, resume=None, restart=None):
     tcfg = cfg["train"]
     arch = cfg["model"].get("arch", "unknown")
 
+    # ---- 分层抽样 val 集辅助函数 ----
+    def _stratified_split(ids, data_root, val_ratio, num_classes, seed=42):
+        """分层抽 val：用每图"主类"（频次最高的类别）分层，保持 train/val 类分布接近全量。"""
+        import random as _rng
+        from collections import defaultdict as _dd
+        rng = _rng.Random(seed)
+
+        labels_dir = os.path.join(data_root, "labels")
+        strata = []  # 每张图的"主类" id（类数+1 为哨兵：空图）
+        for stem in ids:
+            txt = os.path.join(labels_dir, stem + ".txt")
+            cls_counter = Counter()
+            if os.path.exists(txt):
+                for line in open(txt, "r", encoding="utf-8"):
+                    parts = line.strip().split()
+                    if len(parts) == 5:
+                        try:
+                            c = int(float(parts[0]))
+                            if 0 <= c < num_classes:
+                                cls_counter[c] += 1
+                        except ValueError:
+                            continue
+            strata.append(cls_counter.most_common(1)[0][0] if cls_counter else num_classes)
+
+        groups = _dd(list)
+        for idx, s in enumerate(strata):
+            groups[s].append(idx)
+
+        train_indices, val_indices = [], []
+        for stratum, idx_list in groups.items():
+            n_val_s = max(1, int(round(len(idx_list) * val_ratio)))
+            n_val_s = min(n_val_s, len(idx_list))
+            perm = rng.sample(idx_list, len(idx_list))
+            val_indices.extend(perm[:n_val_s])
+            train_indices.extend(perm[n_val_s:])
+        rng.shuffle(train_indices)
+
+        train_ids = [ids[i] for i in train_indices]
+        val_ids = [ids[i] for i in val_indices]
+
+        # strata 分布对比日志
+        full_dist = Counter(strata)
+        val_dist = Counter(strata[i] for i in val_indices)
+        train_dist = Counter(strata[i] for i in train_indices)
+        log.info(f"Stratified val split (val_ratio={val_ratio}): "
+                 f"{len(train_ids)} train / {len(val_ids)} val")
+        log.info(f"  {'class':>6s}  {'full':>5s}  {'train':>5s}  {'val':>5s}  "
+                 f"{'full%':>6s}  {'val%':>6s}")
+        for c in sorted(full_dist.keys()):
+            nf, nt, nv = full_dist[c], train_dist.get(c, 0), val_dist.get(c, 0)
+            log.info(f"  {c:>6d}  {nf:>5d}  {nt:>5d}  {nv:>5d}  "
+                     f"{nf/len(ids)*100:>5.1f}%  {nv/len(val_ids)*100:>5.1f}%")
+
+        return train_ids, val_ids
+
+    def _resolve(split_key):
+        """Resolve (data_root, split_file) for a split."""
+        data_root = cfg["data"].get("data_root")
+        sp = cfg["data"].get(split_key)
+        if sp and os.path.isabs(sp) and os.path.isdir(sp):
+            return sp, None
+        if sp:
+            return data_root, os.path.join(data_root, sp) if data_root else sp
+        return data_root, None
+
     # ---- 生成唯一运行标识（git commit + 时间戳）----
     # 每次训练都在独立子文件夹下，互不覆盖；日志文件名也与之对齐。
     project_root = Path(__file__).resolve().parent.parent
@@ -235,25 +302,6 @@ def train(cfg, resume=None, restart=None):
     img_size = int(cfg["data"]["img_size"])
     ncls = int(cfg["model"]["num_labels"])
 
-    def _resolve(split_key):
-        """Resolve (data_root, split_file) for a split.
-
-        Supports two config styles:
-          1) data_root + split_file:  split_key = "splits/train.txt" (relative
-             to data_root); data_root holds visible/infrared/depth/labels subdirs.
-          2) split_key = absolute directory path: the directory itself holds
-             visible/infrared/depth/labels; data_root = that dir, split_file = None
-             (auto-scan labels/). This is how AIC2026 train/test sets are laid
-             out — two independent dataset directories.
-        """
-        data_root = cfg["data"].get("data_root")
-        sp = cfg["data"].get(split_key)
-        if sp and os.path.isabs(sp) and os.path.isdir(sp):
-            return sp, None
-        if sp:
-            return data_root, os.path.join(data_root, sp) if data_root else sp
-        return data_root, None
-
     train_root, train_split = _resolve("train_split")
     val_root, val_split = _resolve("val_split")
     if train_root is None:
@@ -287,14 +335,19 @@ def train(cfg, resume=None, restart=None):
             data_root=train_root, split_file=train_split,
             img_size=img_size, train=True, num_classes=ncls,
             depth_encoding=depth_enc)
-        n_total = len(full_ds)
         val_ratio = float(cfg["data"].get("val_ratio", 0.1))
-        n_val = max(1, int(round(n_total * val_ratio)))
-        n_train = n_total - n_val
-        g = torch.Generator().manual_seed(42)
-        perm = torch.randperm(n_total, generator=g).tolist()
-        train_ids = [full_ds.ids[i] for i in perm[:n_train]]
-        val_ids = [full_ds.ids[i] for i in perm[n_train:]]
+        # 默认 stratified split；设 data.stratified_val_split=false 可回退到随机
+        use_stratified = cfg["data"].get("stratified_val_split", True)
+        if use_stratified:
+            train_ids, val_ids = _stratified_split(
+                full_ds.ids, train_root, val_ratio, ncls, seed=42)
+        else:
+            n_total = len(full_ds)
+            n_val = max(1, int(round(n_total * val_ratio)))
+            g = torch.Generator().manual_seed(42)
+            perm = torch.randperm(n_total, generator=g).tolist()
+            train_ids = [full_ds.ids[i] for i in perm[:-n_val]]
+            val_ids = [full_ds.ids[i] for i in perm[-n_val:]]
         train_ds = MultiModalDataset(
             data_root=train_root, ids=train_ids,
             img_size=img_size, train=True, num_classes=ncls,

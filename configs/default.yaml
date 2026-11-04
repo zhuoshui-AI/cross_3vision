@@ -7,6 +7,10 @@ data:
   # val_split 不填 = 从训练集按 val_ratio 切出验证集（测试集无标注，不适合做 val）
   # val_split: "/HUBU-AI027/AIdemo/测试集/AIC2026_PHASE_1_1000"
   val_ratio: 0.1                # 从训练集切 10% 当 val（2000 张 → 200 val）
+  # stratified_val_split: true = 按每图"主类"分层抽样，保证 val 类分布与全量一致
+  #   val=200 张时随机切的 L1 分布偏差 p95=0.196，分层后接近 0
+  #   设 false 回退随机 split（调试旧模型或与旧 checkpoint 对齐时）
+  stratified_val_split: true
   test_split: "/HUBU-AI027/AI_competition/data/AIC2026_PHASE_2_1000"  # 复赛测试集，仅 inference 用
   img_size: 640                # 训练/推理统一边长（Swin 下采样 32x → 特征图 16x16）
   num_workers: 8
@@ -156,11 +160,12 @@ train:
   # 触发条件：连续 patience 次验证（每 val_interval 个 epoch 一次），
   # mAP@50-95 提升都 < min_delta → 视为进入平台期，自动停训
   # early_stop_patience: 连续 N 次"无实质提升"的验证（0 = 关闭早停）
-  # early_stop_min_delta: 提升幅度超过该值才算"实质提升"，
-  #                      用于过滤验证集随机波动（val 200 张图波动 ~±0.005）
+  # early_stop_min_delta: 提升幅度超过该值才算"实质提升"
+  #   经验估计：val=200 张时采样波动上界 ±0.0069，故 min_delta 须 ≥0.007
+  #   设为 0.008（建议区间 0.0035~0.0104 的中上段），过滤噪声但不敏感
   # early_stop_warmup_epochs: 前 N 个 epoch 早停不工作，让模型充分爬升
   early_stop_patience: 6
-  early_stop_min_delta: 0.005
+  early_stop_min_delta: 0.008
   early_stop_warmup_epochs: 30
 
 # Loss weights (DETR 默认)
