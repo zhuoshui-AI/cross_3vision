@@ -10,7 +10,9 @@ import json
 import math
 import os
 import re
+import subprocess
 import sys
+import time
 from pathlib import Path
 
 import torch
@@ -31,6 +33,57 @@ else:
     from .eval import evaluate
     from .model import build_model
     from .utils import (EMA, load_yaml_config, save_ckpt, set_seed, setup_logging)
+
+
+def _get_git_info(project_root):
+    """获取当前仓库的 git 信息，返回 (sha, branch, subject, dirty)。
+
+    任一步失败都回退到占位字符串，保证训练不因为 git 不可用而中断。
+    """
+    sha = "nogit"
+    branch = "unknown"
+    subject = "no-commit"
+    dirty = False
+    try:
+        def _run(*args):
+            return subprocess.check_output(
+                ["git", "-C", str(project_root), *args],
+                stderr=subprocess.DEVNULL, text=True, timeout=10).strip()
+        sha = _run("rev-parse", "--short=7", "HEAD") or sha
+        branch = _run("rev-parse", "--abbrev-ref", "HEAD") or branch
+        subject = _run("log", "-1", "--format=%s") or subject
+        dirty = bool(_run("status", "--porcelain"))
+    except Exception:
+        pass
+    return sha, branch, subject, dirty
+
+
+def _sanitize_name(text, max_len=40):
+    """把任意文本转成安全的文件/文件夹名。
+
+    - 只保留字母、数字、下划线、连字符
+    - 连续多个分隔符折叠成一个
+    - 截断到 max_len 字符
+    - 转小写
+    """
+    text = text.lower().strip()
+    text = re.sub(r"[^\w\-]+", "_", text)  # 非字母数字下划线连字符 → _
+    text = re.sub(r"_+", "_", text).strip("_-")  # 连续 _ → 单个
+    return text[:max_len] or "untitled"
+
+
+def _build_run_name(project_root):
+    """生成本次运行的唯一标识名：{sha7}_{safe_subject}_{timestamp}。
+
+    示例：`a1b2c3d_fix_depth_encoding_20261104_143025`
+    """
+    sha, _branch, subject, dirty = _get_git_info(project_root)
+    safe_subj = _sanitize_name(subject)
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    name = f"{sha}_{safe_subj}_{ts}"
+    if dirty:
+        name += "_dirty"
+    return name, sha, subject, dirty
 
 
 def _move_batch(batch, device):
@@ -132,19 +185,35 @@ def train(cfg, resume=None, restart=None):
     tcfg = cfg["train"]
     arch = cfg["model"].get("arch", "unknown")
 
-    # 根据架构自动隔离输出目录，避免多终端并行训练互相覆盖
-    # 用户也可通过 --set train.ckpt_dir=xxx / train.log_dir=xxx 手动覆盖
+    # ---- 生成唯一运行标识（git commit + 时间戳）----
+    # 每次训练都在独立子文件夹下，互不覆盖；日志文件名也与之对齐。
+    project_root = Path(__file__).resolve().parent.parent
+    run_name, git_sha, git_subject, git_dirty = _build_run_name(project_root)
+
+    # 手动覆盖：如果用户通过 --set 指定了完整路径，尊重其选择；
+    # 否则按 base/arch/run_name 的层级自动隔离。
+    force_run_dir = tcfg.get("force_run_dir", False)
     for key in ("ckpt_dir", "log_dir"):
         raw = tcfg.get(key) or f"./outputs/{key.replace('_dir','')}"
+        # 如果用户已手动指定到 arch/run_name 级别，就不再追加
+        if force_run_dir or run_name in raw.split(os.sep):
+            tcfg[key] = raw
+            continue
+        # 先确保有 /{arch}，再加 /{run_name}
         if f"/{arch}" not in raw and f"\\{arch}" not in raw:
-            tcfg[key] = raw.rstrip("/\\") + f"/{arch}"
+            raw = raw.rstrip("/\\") + f"/{arch}"
+        tcfg[key] = raw.rstrip("/\\") + f"/{run_name}"
 
-    log = setup_logging(tcfg.get("log_dir"), "multimodal_swin_detr")
+    # setup_logging 用 run_name 作 run_id，日志文件名 train_{run_name}.log
+    log = setup_logging(tcfg.get("log_dir"), "multimodal_swin_detr", run_id=run_name)
     set_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # 打印清晰的启动 banner，一眼看出本次训练使用的架构
+    # 打印清晰的启动 banner
     log.info("=" * 60)
+    log.info(f"  Run name              : {run_name}")
+    log.info(f"  Git commit            : {git_sha}  {'(dirty)' if git_dirty else ''}")
+    log.info(f"  Git subject           : {git_subject}")
     log.info(f"  Network architecture : {arch}")
     log.info(f"  Device                : {device}")
     log.info(f"  Image size            : {cfg['data']['img_size']}")
@@ -458,27 +527,8 @@ def train(cfg, resume=None, restart=None):
             break
 
     log.info(f"Training done. Best mAP@50-95 = {best:.4f}")
-
-    # ---- 训练结束时输出 git 版本号 + 最近一次提交摘要 ----
-    import subprocess as _sp
-    try:
-        def _run_git(*args):
-            return _sp.check_output(
-                ["git", "-C", os.path.dirname(os.path.dirname(__file__)), *args],
-                stderr=_sp.DEVNULL, text=True, timeout=10).strip()
-        sha = _run_git("rev-parse", "--short", "HEAD")
-        branch = _run_git("rev-parse", "--abbrev-ref", "HEAD")
-        try:
-            last = _run_git("log", "-1", "--format=%s  (%ci)")
-        except _sp.CalledProcessError:
-            last = "(无提交记录)"
-        dirty = bool(_run_git("status", "--porcelain"))
-        log.info(f"--- Git 版本快照 ---")
-        log.info(f"  commit : {sha}  branch : {branch}")
-        log.info(f"  last   : {last}")
-        log.info(f"  dirty  : {'是（有未提交改动）' if dirty else '否'}")
-    except Exception as e:
-        log.info(f"(git 信息不可用: {e})")
+    log.info(f"Run saved to: {tcfg['ckpt_dir']}")
+    log.info(f"Run log     : {log.log_file}")
 
 
 def _apply_overrides(cfg, overrides):

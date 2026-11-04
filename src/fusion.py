@@ -4,11 +4,20 @@
   multi-modal backbone output and the DETR encoder. Fused RGB+IR features
   are Queries, depth features are Keys/Values; the depth validity mask is
   used as key_padding_mask. Leaves DETR's encoder/decoder untouched.
+  Now with a learnable spatial gate on the Q side to suppress depth
+  injection where it is not helpful.
 
 - HCMAFBlock / JointWindowCrossAttention (TMSC-Det): hierarchical
   cross-modal attention fusion — window-based joint attention over all
   modalities at each fused stage, with shared Q/K/V projection, spatial
   relative position bias and modality-pair bias.
+
+  Pre-gate (表征层面门控, 融合前加权): each modality's feature map is
+  multiplied by a pixel-wise 2*sigmoid gate before entering the joint
+  cross-attention, so the model can learn to suppress noisy channels
+  spatially. Random modality dropout zeroes out both the gate weight
+  and the attention keys for the dropped modality (三重保险: pre-gate
+  置零 + attn key mask + post-gate logits mask).
 
 - SimpleFPN: top-down + PAN bottom-up pathway producing multi-scale
   P2~P5 features at a unified channel count.
@@ -16,6 +25,45 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+
+# ======================================================================
+# Pre-gate: pixel-wise representation gating (融合前门控)
+# ======================================================================
+
+class _PreGate(nn.Module):
+    """像素级门控: w = 2 * sigmoid(Conv(GELU(Conv(x))))
+    
+    2*sigmoid(x) 把输出映射到 (0, 2)，中心 1.0。初始全零初始化 → 
+    中间层输出全 0 → 末层输出全 0 → sigmoid(0)=0.5 → 2*0.5=1.0，
+    门控起点严格恒等，不破坏预训练特征。
+    
+    使用方式: gated = w * x。
+    """
+
+    def __init__(self, dim, reduction=4):
+        super().__init__()
+        hidden = max(dim // reduction, 16)
+        self.net = nn.Sequential(
+            nn.Conv2d(dim, hidden, 1, bias=False),
+            nn.GroupNorm(8, hidden),
+            nn.GELU(),
+            nn.Conv2d(hidden, 1, 1, bias=True),
+        )
+        # 全零初始化：第一层 Conv + GroupNorm weight/bias + 末层 Conv weight/bias
+        # 全部置零 → 输出严格 0 → sigmoid(0)=0.5 → 2*0.5=1.0
+        for m in self.net.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.zeros_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.GroupNorm):
+                nn.init.zeros_(m.weight)
+                nn.init.zeros_(m.bias)
+
+    def forward(self, x):
+        w = self.net(x)              # (B, 1, H, W)
+        return 2.0 * torch.sigmoid(w)  # (B, 1, H, W), range (0, 2), center 1.0
 
 
 class DepthLateFusion(nn.Module):
@@ -34,11 +82,20 @@ class DepthLateFusion(nn.Module):
     将 out_proj 与 FFN 末层置零后，模块在训练起点是严格恒等映射
     f_enh = fused（与「旁路深度融合」等价），深度信息随后被渐进注入，
     对称性可像原生 DETR 一样正常打破。HCMAF 采用的是同一套技巧。
+
+    空间门控（PreGate）：Q 侧 fused RGB+IR 特征图先经像素级门控加权
+    再进入 cross-attn，让模型学习在哪些位置需要深度注入、哪些位置
+    RGB+IR 已足够（如天空、远处均匀区域）。门控同样使用 2*sigmoid
+    中心 1.0 初始化，起点不破坏预训练特征。
     """
 
-    def __init__(self, d_model=256, num_heads=8, dropout=0.0, ffn_mult=4):
+    def __init__(self, d_model=256, num_heads=8, dropout=0.0, ffn_mult=4,
+                 enable_pre_gate=True, gate_reduction=4):
         super().__init__()
         self.d_model = d_model
+        self.enable_pre_gate = enable_pre_gate
+        if enable_pre_gate:
+            self.q_gate = _PreGate(d_model, reduction=gate_reduction)
         self.cross_attn = nn.MultiheadAttention(
             d_model, num_heads, dropout=dropout, batch_first=True)
         self.norm_q = nn.LayerNorm(d_model)
@@ -74,6 +131,13 @@ class DepthLateFusion(nn.Module):
         q_raw = fused.flatten(2).transpose(1, 2)            # (B, hw, C)
         kv = self.norm_kv(depth_feat.flatten(2).transpose(1, 2))  # (B, hw, C)
 
+        # ===== 融合前门控：让模型学习在哪些位置需要深度 =====
+        if self.enable_pre_gate:
+            w_q = self.q_gate(fused).flatten(2).transpose(1, 2)  # (B, hw, 1)
+            q_gated = q_raw * w_q                                # (B, hw, C)
+        else:
+            q_gated = q_raw
+
         key_padding_mask = None
         if depth_mask is not None:
             # nn.MultiheadAttention: True in key_padding_mask == ignore that key.
@@ -87,9 +151,10 @@ class DepthLateFusion(nn.Module):
                 idx = (h * w) // 2
                 key_padding_mask[all_invalid, idx] = False
 
-        attn_out, _ = self.cross_attn(self.norm_q(q_raw), kv, kv,
+        attn_out, _ = self.cross_attn(self.norm_q(q_gated), kv, kv,
                                       key_padding_mask=key_padding_mask,
                                       need_weights=False)
+        # 残差仍接原始 q_raw —— identity 路径畅通，门控只影响 attn 内部
         out = q_raw + attn_out          # 零初始化下 = q_raw
         out = out + self.ffn(self.norm_out(out))  # 零初始化下 = out
 
@@ -238,20 +303,35 @@ class JointWindowCrossAttention(nn.Module):
 class HCMAFBlock(nn.Module):
     """One fusion block at a single scale.
 
-    Pipeline per scale: shared joint-window cross-attention across modalities
-    → per-modality FFN residual → reliability-gated aggregation into one fused
-    map. Training-only modality dropout masks one whole modality (attention
-    keys + gate) so the fused prediction stays usable when a sensor degrades.
+    Pipeline per scale:
+      1) Pre-gate (融合前门控): 每个模态的特征图先经像素级 2*sigmoid 门控
+         加权再进入联合窗口 cross-attn，残差接原始 x 保证 identity 畅通。
+      2) Joint-window cross-attention → per-modality FFN residual.
+      3) Post reliability-gate (融合后门控): sample 级 softmax 聚合。
+
+    Training-only modality dropout: 三重保险让被遮挡模态完全不贡献——
+      (a) pre-gate 权重强制置零 → 表征不进 cross-attn；
+      (b) JointWindowCrossAttention 的 key mask → 其他模态 attend 不到；
+      (c) post-gate logits 置 -inf → 聚合阶段权重为 0。
     """
 
     def __init__(self, dim, num_heads, window_size=8, num_modal=3,
                  ffn_mult=4, gate_reduction=4, dropout=0.0,
-                 modality_dropout=0.1):
+                 modality_dropout=0.1, enable_pre_gate=True):
         super().__init__()
         self.M = num_modal
         self.modality_dropout = float(modality_dropout)
+        self.enable_pre_gate = enable_pre_gate
+        # ===== 融合前像素级门控 =====
+        if enable_pre_gate:
+            self.pre_gate = nn.ModuleList([
+                _PreGate(dim, reduction=gate_reduction)
+                for _ in range(num_modal)
+            ])
+        # ===== 联合窗口 cross-attn =====
         self.attn = JointWindowCrossAttention(
             dim, num_heads, window_size=window_size, num_modal=num_modal)
+        # ===== per-modality FFN =====
         self.ffn_norm = nn.ModuleList([nn.LayerNorm(dim) for _ in range(num_modal)])
         self.ffn = nn.ModuleList([
             nn.Sequential(
@@ -264,6 +344,7 @@ class HCMAFBlock(nn.Module):
         for net in self.ffn:
             nn.init.zeros_(net[-2].weight)
             nn.init.zeros_(net[-2].bias)
+        # ===== 融合后 reliability gate (sample 级 softmax 聚合) =====
         hidden = max(dim // gate_reduction, 16)
         self.gate = nn.Sequential(
             nn.Linear(dim, hidden), nn.GELU(), nn.Linear(hidden, 1))
@@ -277,12 +358,29 @@ class HCMAFBlock(nn.Module):
         returns: fused (B,C,H,W), updated list of M maps, alpha (B,M)
         """
         x = torch.stack(feats, dim=0)                 # (M,B,C,H,W)
+        B = x.shape[1]
         dropped = None
         if self.training and self.modality_dropout > 0 \
                 and torch.rand(1, device=x.device).item() < self.modality_dropout:
             dropped = int(torch.randint(0, self.M, (1,), device=x.device).item())
 
-        attn_out = self.attn(x, key_valid=key_valid, dropped_modality=dropped)
+        # ===== Step 1: 融合前门控 (表征层面加权) =====
+        # 门控只影响 attn 内部的 Q/K/V，残差仍接原始 x 保证 identity 畅通。
+        if self.enable_pre_gate:
+            gated_x = x.clone()
+            for m in range(self.M):
+                w_m = self.pre_gate[m](x[m])          # (B, 1, H, W) ∈ (0,2)
+                # 被遮挡模态：门控强制置零 → 表征彻底不进 cross-attn
+                if dropped is not None and m == dropped:
+                    w_m = torch.zeros_like(w_m)
+                gated_x[m] = w_m * x[m]
+        else:
+            gated_x = x
+
+        # ===== Step 2: 联合窗口 cross-attn =====
+        attn_out = self.attn(gated_x, key_valid=key_valid,
+                             dropped_modality=dropped)
+        # 残差接原始 x（identity 路径），attn 在 gated_x 上计算
         z = x + attn_out  # single residual: attn returns the delta only
 
         z_maps = []
@@ -291,7 +389,8 @@ class HCMAFBlock(nn.Module):
             zm = zm + self.ffn[m](self.ffn_norm[m](zm))
             z_maps.append(zm.permute(0, 3, 1, 2).contiguous())
 
-        # Reliability gate: one scalar per (sample, modality), softmax over M.
+        # ===== Step 3: 融合后 reliability gate =====
+        # sample 级 softmax 聚合 —— 决定各模态对最终 fused 特征的贡献比
         z_stack = torch.stack(z_maps, dim=0)          # (M,B,C,H,W)
         g = self.gate(z_stack.mean(dim=(-2, -1)))     # (M,B,1)
         logits = g.squeeze(-1).permute(1, 0)          # (B,M)

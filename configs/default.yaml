@@ -28,10 +28,14 @@ model:
   # 深度交叉注意力（P5 注入），rgbir_swin/tri_swin 分支共用这两个键
   depth_fuse_heads: 8
   depth_fuse_dropout: 0.0              # 0 = train/eval 前向完全一致（小数据集更稳）
+  # 深度注入的 Q 侧空间门控（PreGate）：让模型学习在哪些位置需要深度信息、
+  # 哪些位置 RGB+IR 已足够（天空/远处均匀区域自动抑制）。2*sigmoid 中心 1.0，
+  # 起点不破坏预训练特征；关闭（false）退回原有 cross-attn。
+  depth_fuse_pre_gate: true
   # 深度输入编码方式：
   #   linear = 1 通道线性 /20000 + mask（旧行为，默认，向后兼容）
   #   geo3   = 3 通道 [log | inverse | valid] 几何编码（需重训，旧 ckpt 不兼容）
-  depth_encoding: "linear"
+  depth_encoding: "geo3"
 
   # FPN（P2~P5, stride 4/8/16/32）中送入 DETR encoder 的层级。
   # 实验证据：单尺度 stride-32 时训练集 cardinality error 长期 ≈4.5 压不下去
@@ -80,6 +84,11 @@ model:
   tri_fuse_stages: [1, 2, 3, 4]
   tri_window_size: 8                      # 联合窗口注意力窗大小（特征尺度均被 8 整除）
   tri_modality_dropout: 0.1               # 训练随机遮蔽整路模态，提升单模退化鲁棒性
+  # 表征层面门控（PreGate, 融合前加权）：每个模态的特征图先经像素级 2*sigmoid
+  # 门控加权再送入联合窗口 cross-attn，残差接原始特征保证 identity 畅通。
+  # 与 modality_dropout 配合：遮挡模态的 pre-gate 权重强制置零 → 表征彻底
+  # 不进 cross-attn（三重保险: pre-gate 置零 + attn key mask + post-gate logits mask）。
+  tri_enable_pre_gate: true
   tri_drop_path_rate: 0.0
   tri_fpn_scales: [4, 8, 16, 32]          # FPN 输出 P2/P3/P4/P5（参考值，实际由 fuse_stages 决定）
   # DETR encoder 吃 P2/P3/P4/P5 四层（stride 4/8/16/32）
@@ -147,7 +156,7 @@ train:
   # early_stop_patience: 连续 N 次验证（每 val_interval 个 epoch 一次）无显著
   #                      提升则停训；0 = 关闭
   # early_stop_min_delta: 提升幅度超过该值才算"显著提升"
-  early_stop_patience: 0
+  early_stop_patience: 10
   early_stop_min_delta: 0.0
 
 # Loss weights (DETR 默认)

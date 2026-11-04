@@ -112,6 +112,7 @@ class RGBIRSwinFusionBackbone(nn.Module):
             d_model=d_model,
             num_heads=int(mcfg.get("depth_fuse_heads", 8)),
             dropout=float(mcfg.get("depth_fuse_dropout", 0.0)),
+            enable_pre_gate=bool(mcfg.get("depth_fuse_pre_gate", True)),
         )
 
         self.d_model = d_model
@@ -617,11 +618,13 @@ class TriModalSwinFusion(nn.Module):
             raise ValueError("tri_fuse_stages must contain at least one stage")
         window = int(mcfg.get("tri_window_size", 8))
         mdrop = float(mcfg.get("tri_modality_dropout", 0.1))
+        pre_gate = bool(mcfg.get("tri_enable_pre_gate", True))
         self.fusers = nn.ModuleDict({
             str(i): HCMAFBlock(
                 dim=embed_dim * (2 ** i),
                 num_heads=embed_dim * (2 ** i) // 32,
-                window_size=window, modality_dropout=mdrop)
+                window_size=window, modality_dropout=mdrop,
+                enable_pre_gate=pre_gate)
             for i in self.fuse_stage_idx})
         fpn_in = [embed_dim * (2 ** i) for i in self.fuse_stage_idx]
         self.fpn = SimpleFPN(fpn_in, self.d_model)
