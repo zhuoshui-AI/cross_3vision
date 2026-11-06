@@ -356,8 +356,9 @@ def train(cfg, resume=None, restart=None):
             data_root=train_root, ids=val_ids,
             img_size=img_size, train=False, num_classes=ncls,
             depth_encoding=depth_enc)
-        log.info(f"Split train set {train_root}: {n_train} train / {n_val} val "
-                 f"(val_ratio={val_ratio})")
+        log.info(f"Split train set {train_root}: {len(train_ids)} train / "
+                 f"{len(val_ids)} val (val_ratio={val_ratio}, "
+                 f"stratified={bool(use_stratified)})")
 
     nw = int(cfg["data"].get("num_workers", 4))
     train_loader = DataLoader(
