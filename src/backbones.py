@@ -374,15 +374,26 @@ def _read_tensor_file(path):
 
 
 def _remap_hf_dinov2(state):
-    """HuggingFace DINOv2 命名 → timm 命名（DINOv2 的 QKV 本就是融合单线性）。
+    """HuggingFace DINOv2 命名 → timm 命名。
 
     对应关系：embeddings.patch_embeddings.projection → patch_embed.proj、
-    attention.attention → attn.qkv、attention.output.dense → attn.proj、
-    layernorm_before/after → norm1/norm2、mlp.intermediate/output.dense →
-    mlp.fc1/fc2。
+    attention.attention → attn.qkv（AnyThermal 为拆分 query/key/value 三个
+    Linear，融合为 timm 的单 qkv；transformers 官方 DINOv2 是融合单线性）、
+    attention.output.dense → attn.proj、layernorm_before/after → norm1/norm2、
+    mlp.intermediate/output.dense → mlp.fc1/fc2、
+    layer_scale1/2.lambda1 → ls1/ls2.gamma。
     """
+    import re
     out = {}
+    split_qkv = {}  # (blocks.N, "weight"|"bias") -> {"query"/"key"/"value": tensor}
     for k, v in state.items():
+        m = re.match(
+            r"^encoder\.layer\.(\d+)\.attention\.attention\."
+            r"(query|key|value)\.(weight|bias)$", k)
+        if m:
+            key = (f"blocks.{m.group(1)}", m.group(3))
+            split_qkv.setdefault(key, {})[m.group(2)] = v
+            continue
         nk = k
         if nk.startswith("encoder.layer."):
             nk = "blocks." + nk[len("encoder.layer."):]
@@ -393,6 +404,8 @@ def _remap_hf_dinov2(state):
               .replace(".attention.output.dense.", ".attn.proj.")
               .replace(".layernorm_before.", ".norm1.")
               .replace(".layernorm_after.", ".norm2.")
+              .replace(".layer_scale1.lambda1", ".ls1.gamma")
+              .replace(".layer_scale2.lambda1", ".ls2.gamma")
               .replace(".mlp.intermediate.dense.", ".mlp.fc1.")
               .replace(".mlp.output.dense.", ".mlp.fc2."))
         if nk == "embeddings.cls_token":
@@ -402,6 +415,11 @@ def _remap_hf_dinov2(state):
         elif nk.startswith("layernorm."):
             nk = "norm." + nk[len("layernorm."):]
         out[nk] = v
+    # timm 融合 qkv 的排布是 [q; k; v]（dim0 拼接）
+    for (blk, wb), parts in split_qkv.items():
+        if set(parts) == {"query", "key", "value"}:
+            out[f"{blk}.attn.qkv.{wb}"] = torch.cat(
+                [parts["query"], parts["key"], parts["value"]], dim=0)
     return out
 
 
