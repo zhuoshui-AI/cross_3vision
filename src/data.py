@@ -43,6 +43,11 @@ def _make_transform(cls, size, **extra):
 
 IMG_EXTS = (".jpg", ".jpeg", ".png")
 
+# 小目标 copy-paste 默认目标类（弱类，按 per-class AP 证据选取）：
+#   0 person / 1 boat / 4 sign / 5 bicycle / 7 ball —— AP 最低的五个类，
+#   全部是小目标。copy_paste_classes 未显式配置时用它；传 [] 关闭。
+_CP_WEAK_CLASSES = (0, 1, 4, 5, 7)
+
 # ImageNet statistics for RGB branch (Swin expects these).
 _RGB_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
 _RGB_STD = np.array([0.229, 0.224, 0.225], dtype=np.float32)
@@ -107,7 +112,10 @@ class MultiModalDataset(Dataset):
 
     def __init__(self, data_root, split_file=None, ids=None,
                  img_size=512, train=True, num_classes=12,
-                 scan_source="labels", depth_encoding="linear"):
+                 scan_source="labels", depth_encoding="linear",
+                 copy_paste_prob=0.0, copy_paste_max=3,
+                 copy_paste_classes=None, copy_paste_bank_cap=200,
+                 copy_paste_crop_max=96):
         self.data_root = data_root
         self.img_size = img_size
         self.train = train
@@ -116,6 +124,24 @@ class MultiModalDataset(Dataset):
             raise ValueError(
                 f"depth_encoding 必须是 'linear' 或 'geo3'，得到 {depth_encoding!r}")
         self.depth_encoding = depth_encoding
+
+        # ---- 小目标 copy-paste（P3）：三模态同步粘贴 ----
+        # 仅 train=True 生效；prob=0 或 classes=[] 时完全关闭（零行为差异）。
+        # crops bank 按"数据集实例"存活：多 worker 各持一份（更多样的同时
+        # 天然并行）；首几个 epoch bank 尚未填满，粘贴量会自行爬升。
+        if copy_paste_classes is None:
+            cp_classes = _CP_WEAK_CLASSES
+        else:
+            cp_classes = tuple(int(c) for c in copy_paste_classes)
+        self._cp_classes = cp_classes
+        self._cp_prob = float(copy_paste_prob)
+        self._cp_enabled = (self.train and self._cp_prob > 0.0
+                            and len(cp_classes) > 0)
+        self._cp_max = max(1, int(copy_paste_max))
+        self._cp_bank_cap = max(1, int(copy_paste_bank_cap))
+        self._cp_crop_max = max(8, int(copy_paste_crop_max))
+        self._cp_bank = {}       # cls -> [crop dict]（FIFO，容量上限内滚动）
+        self._cp_stats = {"donated": 0, "pasted": 0, "prob_skip": 0}
 
         self.rgb_dir = os.path.join(data_root, "visible")
         self.ir_dir = os.path.join(data_root, "infrared")
@@ -292,6 +318,15 @@ class MultiModalDataset(Dataset):
         else:
             box_list, label_list = [], []
 
+        # ---- 小目标 copy-paste（P3，仅 train，raw 域、几何变换前）----
+        # 粘贴发生在深度编码/归一化之前、albumentations 几何变换之前：
+        # RGB/IR/Depth/valid-mask 四者在同一矩形区域同步替换，粘贴深度
+        # 保留 donor 的原始毫米值（物理量不允许重采样），标注框随贴随加。
+        if self._cp_enabled:
+            box_list, label_list = self._copy_paste_step(
+                rgb, ir, depth, depth_valid_u8,
+                box_list, label_list, depth_is_mm)
+
         data = self.transform(
             image=rgb, ir=ir, depth=depth, depth_valid=depth_valid_u8,
             bboxes=box_list, class_labels=label_list,
@@ -360,6 +395,126 @@ class MultiModalDataset(Dataset):
             "image_id": torch.tensor(idx, dtype=torch.long),
             "stem": stem,
         }
+
+    # ------------------------------------------------------------------
+    # 小目标 copy-paste（P3）
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _rect_iou_over(box_a, boxes, thr):
+        """box_a (x1,y1,x2,y2) 对一组框的最大 IoU 是否超过 thr。"""
+        if len(boxes) == 0:
+            return False
+        a = np.asarray(box_a, dtype=np.float32)
+        bs = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        iw = np.clip(np.minimum(a[2], bs[:, 2]) - np.maximum(a[0], bs[:, 0]),
+                     0.0, None)
+        ih = np.clip(np.minimum(a[3], bs[:, 3]) - np.maximum(a[1], bs[:, 1]),
+                     0.0, None)
+        inter = iw * ih
+        union = ((a[2] - a[0]) * (a[3] - a[1])
+                 + (bs[:, 2] - bs[:, 0]) * (bs[:, 3] - bs[:, 1]) - inter)
+        return bool((inter / np.clip(union, 1e-9, None) > thr).any())
+
+    def _cp_donate(self, rgb, ir, depth, depth_valid_u8, boxes_px, labels,
+                   is_mm):
+        """把当前图的弱类实例收割进 crops bank（三模态矩形 + 掩码原样拷贝）。
+
+        约束：边 ≥4px、最长边 ≤ _cp_crop_max（默认 96px：真实数据 1920 分辨
+        率下弱类目标都很小，超大的既占 bank 内存也贴得突兀；低分辨率数据
+        可调大）。超限实例跳过不捐。
+        """
+        H, W = rgb.shape[:2]
+        n = 0
+        for (x1, y1, x2, y2), cls in zip(boxes_px, labels):
+            cls = int(cls)
+            if cls not in self._cp_classes:
+                continue
+            ix1, iy1 = max(0, int(round(x1))), max(0, int(round(y1)))
+            ix2, iy2 = min(W, int(round(x2))), min(H, int(round(y2)))
+            w, h = ix2 - ix1, iy2 - iy1
+            if w < 4 or h < 4 or max(w, h) > self._cp_crop_max:
+                continue
+            bank = self._cp_bank.setdefault(cls, [])
+            bank.append({
+                "rgb": rgb[iy1:iy2, ix1:ix2].copy(),
+                "ir": ir[iy1:iy2, ix1:ix2].copy(),
+                "depth": depth[iy1:iy2, ix1:ix2].copy(),
+                "valid": depth_valid_u8[iy1:iy2, ix1:ix2].copy(),
+                "is_mm": bool(is_mm),
+                "cls": cls, "h": h, "w": w,
+            })
+            if len(bank) > self._cp_bank_cap:
+                bank.pop(0)      # FIFO：bank 始终是最近的 crop
+            n += 1
+        self._cp_stats["donated"] += n
+        return n
+
+    def _cp_paste(self, rgb, ir, depth, depth_valid_u8, boxes_px, labels,
+                  is_mm):
+        """从 bank 随机取 crop 贴进当前图（三模态 + 掩码同步，框随贴随加）。
+
+        - 触发概率 _cp_prob（=1.0 时不掷骰，保持与关闭增强时相同的
+          RNG 流，便于 A/B 对比）；每次贴 1~_cp_max 个。
+        - 贴入位置与现有框的最大 IoU 须 <0.3（10 次尝试失败则放弃该次）。
+        - 深度格式必须一致（16bit mm 与 8bit 归一化互贴会污染值域）。
+        """
+        if self._cp_prob < 1.0 and np.random.rand() >= self._cp_prob:
+            self._cp_stats["prob_skip"] += 1
+            return boxes_px, labels, 0
+        classes = [c for c in self._cp_classes if self._cp_bank.get(c)]
+        if not classes:
+            return boxes_px, labels, 0
+        H, W = rgb.shape[:2]
+        n_target = int(np.random.randint(1, self._cp_max + 1))
+        pasted = 0
+        boxes_px = list(boxes_px)
+        labels = list(labels)
+        for _ in range(n_target):
+            cls = int(classes[np.random.randint(len(classes))])
+            bank = self._cp_bank[cls]
+            crop = bank[np.random.randint(len(bank))]
+            if crop["is_mm"] != bool(is_mm):
+                continue
+            ch, cw = crop["h"], crop["w"]
+            if ch >= H or cw >= W:
+                continue
+            placed = False
+            for _try in range(10):
+                x0 = int(np.random.randint(0, W - cw + 1))
+                y0 = int(np.random.randint(0, H - ch + 1))
+                if self._rect_iou_over((x0, y0, x0 + cw, y0 + ch),
+                                        boxes_px, 0.3):
+                    continue
+                placed = True
+                break
+            if not placed:
+                continue
+            rgb[y0:y0 + ch, x0:x0 + cw] = crop["rgb"]
+            ir[y0:y0 + ch, x0:x0 + cw] = crop["ir"]
+            depth[y0:y0 + ch, x0:x0 + cw] = crop["depth"]
+            depth_valid_u8[y0:y0 + ch, x0:x0 + cw] = crop["valid"]
+            boxes_px.append([x0, y0, x0 + cw, y0 + ch])
+            labels.append(cls)
+            pasted += 1
+        self._cp_stats["pasted"] += pasted
+        return boxes_px, labels, pasted
+
+    def _copy_paste_step(self, rgb, ir, depth, depth_valid_u8, boxes_px,
+                         labels, is_mm):
+        """__getitem__ 的入口：先捐（无成本、顺便填 bank）后贴。"""
+        try:
+            self._cp_donate(rgb, ir, depth, depth_valid_u8, boxes_px,
+                            labels, is_mm)
+            boxes_px, labels, _ = self._cp_paste(
+                rgb, ir, depth, depth_valid_u8, boxes_px, labels, is_mm)
+        except Exception:
+            # copy-paste 是纯增益增强：任何意外都不允许炸训练，
+            # 退化为原图原标注即可（保留 stats 供排查）。
+            import logging
+            logging.getLogger(__name__).warning(
+                "copy-paste 失败（退化为无增强样本）", exc_info=True)
+        return boxes_px, labels
 
     @staticmethod
     def _jitter_rgb(rgb_hwc):

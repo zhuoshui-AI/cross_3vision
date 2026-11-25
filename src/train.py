@@ -321,11 +321,22 @@ def train(cfg, resume=None, restart=None):
                         and os.path.abspath(val_root) != os.path.abspath(train_root))
     depth_enc = cfg["model"].get("depth_encoding", "linear")
 
+    # ---- 小目标 copy-paste（P3）：只喂给 train_ds，val/推理完全不参与 ----
+    # 默认值即关闭（prob=0 / classes=[]），不影响任何既有行为；
+    # configs/default.yaml 里的 train.copy_paste_* 是推荐值。
+    cp_kwargs = dict(
+        copy_paste_prob=float(tcfg.get("copy_paste_prob", 0.0)),
+        copy_paste_max=int(tcfg.get("copy_paste_max", 3)),
+        copy_paste_classes=tcfg.get("copy_paste_classes"),
+        copy_paste_bank_cap=int(tcfg.get("copy_paste_bank_cap", 200)),
+        copy_paste_crop_max=int(tcfg.get("copy_paste_crop_max", 96)),
+    )
+
     if use_separate_val:
         train_ds = MultiModalDataset(
             data_root=train_root, split_file=train_split,
             img_size=img_size, train=True, num_classes=ncls,
-            depth_encoding=depth_enc)
+            depth_encoding=depth_enc, **cp_kwargs)
         val_ds = MultiModalDataset(
             data_root=val_root, split_file=val_split,
             img_size=img_size, train=False, num_classes=ncls,
@@ -353,7 +364,7 @@ def train(cfg, resume=None, restart=None):
         train_ds = MultiModalDataset(
             data_root=train_root, ids=train_ids,
             img_size=img_size, train=True, num_classes=ncls,
-            depth_encoding=depth_enc)
+            depth_encoding=depth_enc, **cp_kwargs)
         val_ds = MultiModalDataset(
             data_root=train_root, ids=val_ids,
             img_size=img_size, train=False, num_classes=ncls,
@@ -361,6 +372,55 @@ def train(cfg, resume=None, restart=None):
         log.info(f"Split train set {train_root}: {len(train_ids)} train / "
                  f"{len(val_ids)} val (val_ratio={val_ratio}, "
                  f"stratified={bool(use_stratified)})")
+
+    # ---- 切分名单落盘（固定协议的关键一步）----
+    # 跨脚本 / 跨机器 / 跨时间都用磁盘上的同一份 val 集合评测，
+    # 不再重跑切分逻辑重建，彻底消除"随机重建"引入的泄漏 / 波动。
+    splits_dir = Path(tcfg["ckpt_dir"]) / "splits"
+    splits_dir.mkdir(parents=True, exist_ok=True)
+
+    if use_separate_val:
+        # 独立 val 目录：直接导出 val_root 下列出的 stem；train 同理
+        def _list_stems(d):
+            from .data import MultiModalDataset as _DS  # 避免循环导入失败时提前炸
+            ds = _DS(data_root=d, img_size=img_size, train=False,
+                     num_classes=ncls, depth_encoding=depth_enc)
+            return list(ds.ids)
+        _train_stems = _list_stems(train_root)
+        _val_stems = _list_stems(val_root)
+        _split_kind = "separate"
+    else:
+        _train_stems, _val_stems = list(train_ids), list(val_ids)
+        _split_kind = "stratified" if use_stratified else "random"
+
+    train_txt = splits_dir / "train.txt"
+    val_txt = splits_dir / "val.txt"
+    with open(train_txt, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(_train_stems) + ("\n" if _train_stems else ""))
+    with open(val_txt, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(_val_stems) + ("\n" if _val_stems else ""))
+
+    meta = {
+        "run_name": run_name,
+        "git_sha": git_sha,
+        "git_subject": git_subject,
+        "git_dirty": git_dirty,
+        "data_root": os.path.abspath(train_root),
+        "split_kind": _split_kind,                    # stratified / random / separate
+        "val_ratio": None if use_separate_val else val_ratio,
+        "stratified": None if use_separate_val else bool(use_stratified),
+        "seed": 42,
+        "train_ids_count": len(_train_stems),
+        "val_ids_count": len(_val_stems),
+        "img_size": img_size,
+        "arch": arch,
+        "depth_encoding": depth_enc,
+        "num_labels": ncls,
+    }
+    with open(splits_dir / "split_meta.json", "w", encoding="utf-8") as fh:
+        json.dump(meta, fh, ensure_ascii=False, indent=2)
+    log.info(f"Splits saved → {splits_dir} ({len(_train_stems)} train / "
+             f"{len(_val_stems)} val, kind={_split_kind})")
 
     nw = int(cfg["data"].get("num_workers", 4))
     train_loader = DataLoader(
