@@ -281,6 +281,8 @@ def train(cfg, resume=None, restart=None):
     log.info(f"  Run name              : {run_name}")
     log.info(f"  Git commit            : {git_sha}  {'(dirty)' if git_dirty else ''}")
     log.info(f"  Git subject           : {git_subject}")
+    # 原始命令行快照：事后从日志直接复制即可复现，不依赖记忆
+    log.info(f"  Command               : {sys.executable} {' '.join(sys.argv)}")
     log.info(f"  Network architecture : {arch}")
     log.info(f"  Device                : {device}")
     log.info(f"  Image size            : {cfg['data']['img_size']}")
@@ -549,7 +551,12 @@ def train(cfg, resume=None, restart=None):
             stats["test_coco_eval_bbox"] = [
                 float(x) if x is not None else None for x in coco12]
             prev_best = best
-            if score == score and score > best:  # not NaN & new record
+            # min_delta 是“实质提升”阈值：低于它的涨幅视为采样噪声，
+            # 既不刷新 best.pth，也不重置早停计数。关闭早停时退化为
+            # 任意提升都算，保证 best.pth 仍是真实峰值。
+            min_delta = es_min_delta if es_patience > 0 else 0.0
+            meaningful = score == score and score > prev_best + min_delta
+            if meaningful:
                 best = score
                 save_ckpt(os.path.join(ckpt_dir, "best.pth"),
                           model, optimizer, scheduler, epoch, best, cfg)
@@ -558,15 +565,17 @@ def train(cfg, resume=None, restart=None):
             if es_patience > 0:
                 if epoch < es_warmup:
                     pass  # warmup 期：无论升降都不计数
-                elif score == score and score > prev_best + es_min_delta:
-                    # 实质提升 → 清零
+                elif meaningful:
+                    # 实质提升 → 清零。修复：此前用 prev_best+min_delta 判断，
+                    # 刷新了 best 但涨幅 < min_delta 时不清零，仍在爬升的
+                    # run 也会累计到 patience 被误停。
                     es_bad_evals = 0
                 else:
                     # 持平、波动或下降 → 计数 +1
                     es_bad_evals += 1
-                    gap = (score - best) if score == score else float("nan")
+                    delta = (score - best) if score == score else float("nan")
                     log.info(f"  early-stop: {es_bad_evals}/{es_patience} "
-                             f"（gap={gap:.4f} vs best={best:.4f}）")
+                             f"（Δ={delta:+.4f} vs best={best:.4f}）")
                 if es_bad_evals >= es_patience:
                     early_stop = True
         if ema is not None:

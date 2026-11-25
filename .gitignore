@@ -25,3 +25,4 @@ outputs/
 Thumbs.db
 .DS_Store
 example_data/
+.uploads/

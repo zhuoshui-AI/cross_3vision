@@ -12,14 +12,18 @@ data:
   #   设 false 回退随机 split（调试旧模型或与旧 checkpoint 对齐时）
   stratified_val_split: true
   test_split: "/HUBU-AI027/AI_competition/data/AIC2026_PHASE_2_1000"  # 复赛测试集，仅 inference 用
-  img_size: 640                # 训练/推理统一边长（Swin 下采样 32x → 特征图 16x16）
+  img_size: 960                # 640→960：历史证据（rgbir_swin@960 在 ep229 即达 mAP=0.4117
+                               # / mAP50=0.726 / val loss=6.75，优于 640 跑满 600 epoch 的
+                               # 0.425 / 0.700 / 7.38）；分辨率是比堆 epoch 更强的线性精度杠杆
   num_workers: 8
 
 # ---- Model ----
 model:
-  # 架构开关：rgbir_swin = RGB+IR 4通道拼接 Swin-T(22k) + 深度交叉注意力（默认）；
-  #          tri_swin = TMSC-Det（三塔 + HCMAF + FPN，IR 塔可切 AnyThermal）
-  arch: "rgbir_swin"
+  # 架构开关：tri_swin = TMSC-Det（三塔 RGB/IR/Depth + HCMAF + FPN，主力结构）；
+  #          rgbir_swin = RGB+IR 4通道拼接 Swin-T + 深度交叉注意力
+  # 默认 tri_swin：历史最好成绩（640/600ep mAP=0.425）与最新 run（0.337 strat val）
+  # 全基于 tri_swin；rgbir_swin 主要用于消融与基线对照
+  arch: "tri_swin"
 
   # ---- rgbir_swin：4 通道 Swin 早期融合（替代已删除的 rgbir_resnet）----
   # patch_embed 适配 4 通道：前 3 通道保留预训练 RGB 权重，第 4 通道（IR
@@ -45,9 +49,9 @@ model:
   # 实验证据：单尺度 stride-32 时训练集 cardinality error 长期 ≈4.5 压不下去
   # ——极小目标在 stride-32 上不足一个 cell，是漏检的结构性根源；
   # w≈0.02 的目标（如 4×9px@192）连 stride-8 都不足一个 cell，故加入 stride-4。
-  # 四层全开（640 输入 = 160²+80²+40²+20² = 33800 token）必须搭配模型内的
-  # SDPA 注意力（O(N) 显存）；eager 注意力单层矩阵 ~26GB 必爆 24GB。
-  # 显存吃紧可降级：[8,16,32]=5376 token，[16,32]=1280 token，
+  # 四层全开（960 输入 = 240²+120²+60²+30² = 76500 token）必须搭配模型内的
+  # SDPA 注意力（O(N) 显存）；eager 注意力单层矩阵 ~130GB 必爆 24GB。
+  # 显存/速度吃紧可降级：[8,16,32]=18900 token，[16,32]=4500 token，
   # 被砍层级的细节仍经 PAN bottom-up 通路汇入保留层级。
   rgbir_encoder_scales: [4, 8, 16, 32]
 
@@ -93,11 +97,14 @@ model:
   # 与 modality_dropout 配合：遮挡模态的 pre-gate 权重强制置零 → 表征彻底
   # 不进 cross-attn（三重保险: pre-gate 置零 + attn key mask + post-gate logits mask）。
   tri_enable_pre_gate: true
-  tri_drop_path_rate: 0.0
+  tri_drop_path_rate: 0.2             # 0.0→0.2：随机深度正则。最新 run 末段 train CE=0.055
+                                      # vs val CE=0.466（8.5× 差），过拟合明显；开 0.2 让
+                                      # 可训练 stage 训练时随机跳过 20% block
   tri_fpn_scales: [4, 8, 16, 32]          # FPN 输出 P2/P3/P4/P5（参考值，实际由 fuse_stages 决定）
   # DETR encoder 吃 P2/P3/P4/P5 四层（stride 4/8/16/32）
-  # 640 输入：160²+80²+40²+20² = 33800 token（SDPA 注意力下 24GB 可训）
-  # 显存吃紧可降级：[8,16,32]=5376 token，[16,32]=1280 token
+  # 960 输入：240²+120²+60²+30² = 76500 token（SDPA O(N) 显存，24GB 可训但计算量 640×2.3）
+  # 显存/速度吃紧可降级：[8,16,32]=18900 token, [16,32]=4500 token
+  # 被砍层级的细节仍经 PAN bottom-up 通路汇入保留层级
   tri_encoder_scales: [4, 8, 16, 32]
 
   # DETR head
@@ -131,7 +138,7 @@ id2label:
 
 # ---- Training ----
 train:
-  epochs: 600
+  epochs: 400                    # 600→400：640 输入在 ep370~500 已收敛，后段只增噪声
   batch_size: 1
   grad_accum: 16                 # 等效 batch 16（与原 8×2 保持一致，避免收敛行为突变）
   optimizer: "adamw"
@@ -158,14 +165,15 @@ train:
   log_lines_per_epoch: 10
   # ---- 早停（监控验证 mAP@50-95）----
   # 触发条件：连续 patience 次验证（每 val_interval 个 epoch 一次），
-  # mAP@50-95 提升都 < min_delta → 视为进入平台期，自动停训
+  # mAP@50-95 都没有超过 best + min_delta → 视为进入平台期，自动停训
   # early_stop_patience: 连续 N 次"无实质提升"的验证（0 = 关闭早停）
-  # early_stop_min_delta: 提升幅度超过该值才算"实质提升"
-  #   经验估计：val=200 张时采样波动上界 ±0.0069，故 min_delta 须 ≥0.007
-  #   设为 0.008（建议区间 0.0035~0.0104 的中上段），过滤噪声但不敏感
+  #   按 val_interval=5 折算：20 次 = 100 epoch 无实质提升才停
+  # early_stop_min_delta: 提升幅度超过该值才算"实质提升"（同时决定是否刷新 best.pth）
+  #   实测 200 张 val 平台波动 σ≈0.003，后期真实涨幅常 <0.008；
+  #   取 0.002 只过滤采样噪声，配合 patience=20 不会误停缓慢爬升的 run
   # early_stop_warmup_epochs: 前 N 个 epoch 早停不工作，让模型充分爬升
-  early_stop_patience: 6
-  early_stop_min_delta: 0.008
+  early_stop_patience: 20
+  early_stop_min_delta: 0.002
   early_stop_warmup_epochs: 30
 
 # Loss weights (DETR 默认)
